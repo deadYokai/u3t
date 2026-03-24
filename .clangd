@@ -1,0 +1,14 @@
+CompileFlags:
+  Add:
+    - --target=x86_64-w64-mingw32
+    - -std=c++17
+    - -O2
+    - -Iwrapper/src
+    - -Iwrapper/third_party/zydis/include
+    - -I/usr/x86_64-w64-mingw32/include
+  Compiler: x86_64-w64-mingw32-g++
+
+Diagnostics:
+  Suppress:
+    - -Wmicrosoft-*
+    - -Wunknown-pragmas
