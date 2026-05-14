@@ -2,7 +2,8 @@
 #include <windows.h>
 #include <psapi.h>
 
-typedef struct {
+typedef struct
+{
 	BYTE bytes[256];
 	char mask[256];
 	SIZE_T length;

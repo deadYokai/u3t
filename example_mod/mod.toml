@@ -1,17 +1,8 @@
-# UPK version of temp upk
-upk_version = 684
+name = "ExampleMod"
+version = "1.0.0"
+author = "you"
+description = "Replaces UI_Loading.ChaletComprime-CologneEighty with a custom font"
+enabled = true
 
-# Declare the synthesized blobs in export order.
-# outer defaults to [0, 1, 1, ...] if omitted.
-[[patch.upk]]
-stem   = "MyFont"
-blobs  = ["MyFont.Font", "MyFont_PageA.Texture2D"]
-# outers = [0, 1]   # only needed for non-default topology
+upk_version = 868
 
-[[patch.replace]]
-original    = "UI_Loading.ChaletComprime-CologneEighty"
-replacement = "MyFont"
-
-[[patch.replace]]
-original    = "UI_Loading.ChaletComprime-CologneEighty_PageA"
-replacement = "MyFont.MyFont_PageA"

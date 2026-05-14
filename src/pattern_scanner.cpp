@@ -1,10 +1,12 @@
 #include "pattern_scanner.hpp"
-#include <psapi.h>
 #include <cstdio>
+#include <psapi.h>
 
 BOOL PatternMatch(const BYTE *data, const BYTE *pattern, const char *mask,
-                  SIZE_T length) {
-	for (SIZE_T i = 0; i < length; i++) {
+                  SIZE_T length)
+{
+	for (SIZE_T i = 0; i < length; i++)
+	{
 		if (mask[i] == '?')
 			continue;
 		if (data[i] != pattern[i])
@@ -14,12 +16,15 @@ BOOL PatternMatch(const BYTE *data, const BYTE *pattern, const char *mask,
 }
 
 void *FindPattern(void *baseAddr, SIZE_T searchSize, const BYTE *pattern,
-                  const char *mask, SIZE_T patternLen) {
+                  const char *mask, SIZE_T patternLen)
+{
 	BYTE *current = (BYTE *)baseAddr;
 	BYTE *end = current + searchSize - patternLen;
 
-	while (current < end) {
-		if (PatternMatch(current, pattern, mask, patternLen)) {
+	while (current < end)
+	{
+		if (PatternMatch(current, pattern, mask, patternLen))
+		{
 			return current;
 		}
 		current++;
@@ -29,10 +34,12 @@ void *FindPattern(void *baseAddr, SIZE_T searchSize, const BYTE *pattern,
 }
 
 void *FindPatternInModule(HMODULE module, const BYTE *pattern, const char *mask,
-                          SIZE_T patternLen) {
+                          SIZE_T patternLen)
+{
 	MODULEINFO modInfo;
 	if (!GetModuleInformation(GetCurrentProcess(), module, &modInfo,
-	                          sizeof(modInfo))) {
+	                          sizeof(modInfo)))
+	{
 		return NULL;
 	}
 
@@ -40,17 +47,20 @@ void *FindPatternInModule(HMODULE module, const BYTE *pattern, const char *mask,
 	                   patternLen);
 }
 
-BOOL ParsePatternString(const char *patternStr, ParsedPattern *out) {
+BOOL ParsePatternString(const char *patternStr, ParsedPattern *out)
+{
 	out->length = 0;
 	const char *p = patternStr;
 
-	while (*p && out->length < 256) {
+	while (*p && out->length < 256)
+	{
 		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
 			p++;
 		if (!*p)
 			break;
 
-		if (*p == '?') {
+		if (*p == '?')
+		{
 			out->bytes[out->length] = 0;
 			out->mask[out->length] = '?';
 			out->length++;
@@ -60,19 +70,22 @@ BOOL ParsePatternString(const char *patternStr, ParsedPattern *out) {
 			continue;
 		}
 
-		if (!isxdigit(*p)) {
+		if (!isxdigit(*p))
+		{
 			p++;
 			continue;
 		}
 
 		char hex[3] = {0};
 		hex[0] = *p++;
-		if (*p && isxdigit(*p)) {
+		if (*p && isxdigit(*p))
+		{
 			hex[1] = *p++;
 		}
 
 		unsigned int value;
-		if (sscanf(hex, "%02X", &value) == 1) {
+		if (sscanf(hex, "%02X", &value) == 1)
+		{
 			out->bytes[out->length] = (BYTE)value;
 			out->mask[out->length] = 'x';
 			out->length++;
@@ -82,9 +95,11 @@ BOOL ParsePatternString(const char *patternStr, ParsedPattern *out) {
 	return out->length > 0;
 }
 
-void *FindPatternString(HMODULE module, const char *patternStr) {
+void *FindPatternString(HMODULE module, const char *patternStr)
+{
 	ParsedPattern parsed;
-	if (!ParsePatternString(patternStr, &parsed)) {
+	if (!ParsePatternString(patternStr, &parsed))
+	{
 		return NULL;
 	}
 
@@ -92,8 +107,8 @@ void *FindPatternString(HMODULE module, const char *patternStr) {
 	                           parsed.length);
 }
 
-void *FindPatternWithOffset(HMODULE module, const char *patternStr,
-                            int offset) {
+void *FindPatternWithOffset(HMODULE module, const char *patternStr, int offset)
+{
 	void *found = FindPatternString(module, patternStr);
 	if (!found)
 		return NULL;

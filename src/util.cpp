@@ -3,7 +3,8 @@
 #include <array>
 #include <windows.h>
 
-std::wstring get_exe_dir() {
+std::wstring get_exe_dir()
+{
 	wchar_t buf[32768]{};
 	DWORD len = GetModuleFileNameW(nullptr, buf, (DWORD)std::size(buf));
 	if (!len)
@@ -13,7 +14,8 @@ std::wstring get_exe_dir() {
 	return (pos != std::wstring::npos) ? path.substr(0, pos) : path;
 }
 
-std::wstring to_wide(const std::string &s) {
+std::wstring to_wide(const std::string &s)
+{
 	if (s.empty())
 		return {};
 	int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -24,7 +26,8 @@ std::wstring to_wide(const std::string &s) {
 	return w;
 }
 
-std::string to_narrow(const std::wstring &w) {
+std::string to_narrow(const std::wstring &w)
+{
 	if (w.empty())
 		return {};
 	int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr,
