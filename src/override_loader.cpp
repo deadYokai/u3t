@@ -1,7 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
+#include "override_loader.hpp"
 #include "hook.hpp"
 #include "logs.hpp"
-#include "override_loader.hpp"
 #include "pattern_scanner.hpp"
 #include "ue3_types.hpp"
 #include "util.hpp"
@@ -13,9 +13,13 @@
 #include <unordered_map>
 #include <windows.h>
 
+static constexpr size_t kUObjOff_ObjectFlags = 0x0C;
+static constexpr size_t kUObjOff_HashNext = 0x1C;
+
+static constexpr size_t kUObjOff_Class = 0x4C;
 #ifdef _WIN64
-static constexpr size_t kUObjOff_Outer = 0x40;
-static constexpr size_t kUObjOff_Name = 0x48;
+static constexpr size_t kUObjOff_Outer = 0x3c;
+static constexpr size_t kUObjOff_Name = 0x44;
 static constexpr size_t kUObjSz = 0x60;
 #else
 static constexpr size_t kUObjOff_Outer = 0x28;
@@ -23,6 +27,7 @@ static constexpr size_t kUObjOff_Name = 0x2c;
 static constexpr size_t kUObjSz = 0x3c;
 #endif
 
+static constexpr size_t kUObjMinRead = kUObjOff_Name + 8;
 static constexpr int kSlot_Serialize = 2;
 static constexpr int kSlot_IsLoading = 5;
 static constexpr int kSlot_IsSaving = 6;
@@ -31,7 +36,8 @@ static constexpr int kSlot_LicVer = 9;
 static constexpr int kVtabSlots = 32;
 
 static const char *kPat_Preload =
-    "48 8B C4 55 56 57 41 54 41 55 41 56 41 57 48 81 EC A0 00 00 00";
+    "48 8b c4 55 56 57 41 54 41 55 41 56 41 57 48 81 ec a0 00 00 00 48 c7 44 "
+    "24 60 fe ff ff ff";
 
 namespace
 {
@@ -92,12 +98,15 @@ namespace
 		if (!obj || !ue3().FNameNames)
 			return {};
 
+		if (!safe_read(obj, kUObjMinRead))
+			return {};
+
 		std::vector<std::wstring> parts;
 
 		const void *cur = obj;
 		for (int d = 0; d < 8 && cur; d++)
 		{
-			if (!safe_read(cur, kUObjOff_Name + 8))
+			if (!safe_read(cur, kUObjMinRead))
 				break;
 
 			const auto *b = static_cast<const uint8_t *>(cur);
@@ -105,9 +114,14 @@ namespace
 			int32_t fn_idx;
 			memcpy(&fn_idx, b + kUObjOff_Name, 4);
 
+			auto *names = ue3().FNameNames;
+			if (fn_idx < 0 || fn_idx >= names->Num)
+				break;
+
 			std::wstring seg = fname_str(fn_idx);
 			if (seg.empty())
 				break;
+
 			parts.push_back(seg);
 
 			void *outer = nullptr;
@@ -140,7 +154,8 @@ namespace
 		void *primary_vptr;
 		memcpy(&primary_vptr, base, sizeof(void *));
 
-		for (size_t off = kUObjSz; off + sizeof(void *) <= /*0xC00*/ 0x2000; off += 8)
+		for (size_t off = kUObjSz; off + sizeof(void *) <= /*0xC00*/ 0x2000;
+		     off += 8)
 		{
 			if (!safe_read(base + off, sizeof(void *)))
 				continue;
@@ -289,6 +304,14 @@ namespace
 
 		if (!linker || !obj || !ue3().FNameNames)
 		{
+			if (linker && g_orig_Preload)
+				g_orig_Preload(linker, obj);
+			return;
+		}
+
+		if (!safe_read(static_cast<const uint8_t *>(obj) + kUObjOff_ObjectFlags,
+		               sizeof(uint64_t)))
+		{
 			g_orig_Preload(linker, obj);
 			return;
 		}
@@ -299,6 +322,8 @@ namespace
 			g_orig_Preload(linker, obj);
 			return;
 		}
+
+		log_info("override: Preload '%ls'", path.c_str());
 
 		auto *rec = override_loader::find(path);
 		if (!rec || rec->bin.empty())
@@ -558,6 +583,7 @@ namespace override_loader
 	OverrideRecord *find(const std::wstring &key)
 	{
 		auto it = g_overrides.find(key);
+
 		return (it != g_overrides.end()) ? &it->second : nullptr;
 	}
 

@@ -12,6 +12,7 @@ static constexpr bool kEnable_CreateExport = false;
 static constexpr bool kEnable_SerializePFS = false;
 static constexpr bool kEnable_PreLoadObjs = false;
 static constexpr bool kEnable_FAsyncTick = false;
+static constexpr bool kEnable_FUN_14002b990 = true;
 
 static const char *kPat_Tick =
     "48 89 5C 24 10 57 48 83 EC 30 83 B9 90 06 00 00 00";
@@ -33,6 +34,10 @@ static const char *kPat_PreLoadObjects =
 static const char *kPat_FAsyncTick =
     "53 48 83 EC 30 83 3D ?? ?? ?? ?? 00 48 8B D9";
 
+static const char *kPat_FUN_14002b990 =
+    "48 89 5c 24 20 55 56 57 41 54 41 55 48 81 ec 30 0d 00 00 48 8b 05 2e 3f "
+    "6f 01 48 33 c4 48 89 84 24 20 0d 00 00";
+
 struct ULinkerLoad_opaque;
 struct UObject_opaque;
 struct FAsyncPackage_opaque;
@@ -46,6 +51,7 @@ using Fn_CreateExport = UObject_opaque *(__cdecl *)(UObject_opaque *, int);
 using Fn_SerializePFS = int(__cdecl *)(ULinkerLoad_opaque *);
 using Fn_PreLoadObjects = int(__cdecl *)(FAsyncPackage_opaque *);
 using Fn_FAsyncTick = int(__cdecl *)(FAsyncPackage_opaque *, int, float);
+using Fn_FUN_14002b990 = int(__fastcall *)(uint64_t, char *, rsize_t, uint64_t);
 
 static Fn_Tick g_orig_Tick = nullptr;
 static Fn_Create g_orig_Create = nullptr;
@@ -54,6 +60,7 @@ static Fn_CreateExport g_orig_CE = nullptr;
 static Fn_SerializePFS g_orig_SPFS = nullptr;
 static Fn_PreLoadObjects g_orig_PLO = nullptr;
 static Fn_FAsyncTick g_orig_FAT = nullptr;
+static Fn_FUN_14002b990 g_orig_FUN_14002b990 = nullptr;
 
 static thread_local int s_preload_depth = 0;
 
@@ -126,6 +133,55 @@ static int __cdecl dbg_FAsyncTick(FAsyncPackage_opaque *p, int ul, float tl)
 	return r;
 }
 
+static uint64_t g_runtimeBase = 0;
+static const uint64_t kGhidraImageBase = 0x140000000ULL;
+
+static int __fastcall dbg_FUN_14002b990(uint64_t param_1, char *param_2,
+                                        rsize_t param_3, uint64_t param_4)
+{
+	if (!g_runtimeBase)
+		return param_1;
+
+	uint64_t ghidra_addr = (param_1 - g_runtimeBase) + kGhidraImageBase;
+
+	log_err(">> FUN_14002b990 runtime=0x%llX ghidra=0x%llX flags=0x%llX",
+	         param_1, ghidra_addr, param_4);
+
+	int r = g_orig_FUN_14002b990(param_1, param_2, param_3, param_4);
+
+	// Replace:
+	// "Address = 0xXXXXXXXX"
+	// with:
+	// "Address = 0x1400XXXXXX"
+
+	if (param_2)
+	{
+		char oldbuf[64];
+		char newbuf[64];
+
+		snprintf(oldbuf, sizeof(oldbuf), "Address = 0x%-8X", (uint32_t)param_1);
+
+		snprintf(newbuf, sizeof(newbuf), "Address = 0x%llX", ghidra_addr);
+
+		char *p = strstr(param_2, oldbuf);
+		if (p)
+		{
+			char tmp[4096];
+
+			size_t prefix_len = (size_t)(p - param_2);
+
+			snprintf(tmp, sizeof(tmp), "%.*s%s%s", (int)prefix_len, param_2,
+			         newbuf, p + strlen(oldbuf));
+
+			strcpy_s(param_2, param_3, tmp);
+		}
+
+		log_err("<< %s", param_2);
+	}
+
+	return r;
+}
+
 namespace debug
 {
 
@@ -171,6 +227,10 @@ namespace debug
 
 		maybe_hook(kEnable_FAsyncTick, kPat_FAsyncTick, "FAsyncPackage::Tick",
 		           (void *)&dbg_FAsyncTick, (void **)&g_orig_FAT);
+
+		g_runtimeBase = (uint64_t)GetModuleHandleA(NULL);
+		maybe_hook(kEnable_FUN_14002b990, kPat_FUN_14002b990, "FUN_14002b990",
+		           (void *)&dbg_FUN_14002b990, (void **)&g_orig_FUN_14002b990);
 
 		log_info("debug: install_linker_debug_hooks done (%s)",
 		         all_ok ? "all queued" : "some skipped");

@@ -10,6 +10,199 @@
 #include <vector>
 #include <windows.h>
 
+#ifdef _WIN64
+
+#ifndef UWOP_PUSH_NONVOL
+#define UWOP_PUSH_NONVOL 0
+#define UWOP_ALLOC_LARGE 1
+#define UWOP_ALLOC_SMALL 2
+#define UWOP_SET_FPREG 3
+#define UWOP_SAVE_NONVOL 4
+#define UWOP_SAVE_NONVOL_FAR 5
+#define UWOP_SAVE_XMM128 8
+#define UWOP_SAVE_XMM128_FAR 9
+#define UWOP_PUSH_MACHFRAME 10
+#endif
+
+static int zydis_reg_to_unwind_num(ZydisRegister r)
+{
+	switch (r)
+	{
+		case ZYDIS_REGISTER_RAX:
+			return 0;
+		case ZYDIS_REGISTER_RCX:
+			return 1;
+		case ZYDIS_REGISTER_RDX:
+			return 2;
+		case ZYDIS_REGISTER_RBX:
+			return 3;
+		case ZYDIS_REGISTER_RBP:
+			return 5;
+		case ZYDIS_REGISTER_RSI:
+			return 6;
+		case ZYDIS_REGISTER_RDI:
+			return 7;
+		case ZYDIS_REGISTER_R8:
+			return 8;
+		case ZYDIS_REGISTER_R9:
+			return 9;
+		case ZYDIS_REGISTER_R10:
+			return 10;
+		case ZYDIS_REGISTER_R11:
+			return 11;
+		case ZYDIS_REGISTER_R12:
+			return 12;
+		case ZYDIS_REGISTER_R13:
+			return 13;
+		case ZYDIS_REGISTER_R14:
+			return 14;
+		case ZYDIS_REGISTER_R15:
+			return 15;
+		default:
+			return -1;
+	}
+}
+
+struct UnwindCode
+{
+	uint8_t CodeOffset;
+	uint8_t UnwindOpAndInfo;
+};
+
+struct UnwindInfoHdr
+{
+	uint8_t VersionAndFlags;
+	uint8_t SizeOfProlog;
+	uint8_t CountOfCodes;
+	uint8_t FrameRegAndOff;
+};
+
+static constexpr int kMaxUnwindCodes = 16;
+
+static constexpr size_t kRFSize = sizeof(RUNTIME_FUNCTION);
+
+static size_t rf_offset_for(size_t code_sz)
+{
+	return (code_sz + 3) & ~size_t(3);
+}
+
+static size_t ui_offset_for(size_t code_sz)
+{
+	return rf_offset_for(code_sz) + kRFSize;
+}
+
+struct InstrForUnwind
+{
+	size_t tramp_off;
+	ZydisDecodedInstruction ins;
+	ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+};
+
+static bool write_unwind_data(uint8_t *page_base, size_t tramp_code_sz,
+                              size_t prolog_bytes,
+                              const std::vector<InstrForUnwind> &instrs)
+{
+	struct UCode
+	{
+		uint8_t off;
+		uint8_t op;
+		uint8_t info;
+	};
+
+	std::vector<UCode> codes;
+
+	for (const auto &ir : instrs)
+	{
+		const auto &ins = ir.ins;
+		const auto *ops = ir.ops;
+
+		if (ins.mnemonic == ZYDIS_MNEMONIC_PUSH &&
+		    ins.operand_count_visible >= 1 &&
+		    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+		{
+			int n = zydis_reg_to_unwind_num(ops[0].reg.value);
+			if (n >= 0)
+			{
+				UCode c;
+				c.off = static_cast<uint8_t>(ir.tramp_off + ins.length);
+				c.op = UWOP_PUSH_NONVOL;
+				c.info = static_cast<uint8_t>(n);
+				codes.push_back(c);
+			}
+		}
+		else if (ins.mnemonic == ZYDIS_MNEMONIC_SUB &&
+		         ins.operand_count_visible >= 2 &&
+		         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		         ops[0].reg.value == ZYDIS_REGISTER_RSP &&
+		         ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+		{
+			int64_t alloc = ops[1].imm.value.s;
+			if (alloc > 0 && alloc <= 512 * 1024)
+			{
+				UCode c;
+				c.off = static_cast<uint8_t>(ir.tramp_off + ins.length);
+				if (alloc <= 128)
+				{
+					c.op = UWOP_ALLOC_SMALL;
+					c.info = static_cast<uint8_t>((alloc - 8) / 8);
+					codes.push_back(c);
+				}
+				else
+				{
+					c.op = UWOP_ALLOC_LARGE;
+					c.info = 0;
+					codes.push_back(c);
+					UCode extra{0, static_cast<uint8_t>((alloc / 8) & 0xff),
+					            static_cast<uint8_t>((alloc / 8) >> 8)};
+					codes.push_back(extra);
+				}
+			}
+		}
+	}
+
+	std::reverse(codes.begin(), codes.end());
+
+	if (codes.size() % 2 != 0)
+		codes.push_back({0, 0, 0});
+
+	if (codes.size() > kMaxUnwindCodes)
+	{
+		log_err("hook: unwind codes overflow (%zu > %d)", codes.size(),
+		        kMaxUnwindCodes);
+		return false;
+	}
+
+	size_t rf_off = rf_offset_for(tramp_code_sz);
+	size_t ui_off = ui_offset_for(tramp_code_sz);
+
+	auto *rf = reinterpret_cast<RUNTIME_FUNCTION *>(page_base + rf_off);
+	rf->BeginAddress = 0;
+	rf->EndAddress = static_cast<DWORD>(tramp_code_sz);
+	rf->UnwindData = static_cast<DWORD>(ui_off);
+
+	auto *hdr = reinterpret_cast<UnwindInfoHdr *>(page_base + ui_off);
+	hdr->VersionAndFlags = 1;  // version=1, flags=0
+	hdr->SizeOfProlog = static_cast<uint8_t>(prolog_bytes);
+	hdr->CountOfCodes = static_cast<uint8_t>(codes.size());
+	hdr->FrameRegAndOff = 0;
+
+	auto *uc = reinterpret_cast<UnwindCode *>(page_base + ui_off +
+	                                          sizeof(UnwindInfoHdr));
+	for (size_t i = 0; i < codes.size(); ++i)
+	{
+		uc[i].CodeOffset = codes[i].off;
+		uc[i].UnwindOpAndInfo =
+		    static_cast<uint8_t>((codes[i].info << 4) | codes[i].op);
+	}
+
+	log_info("hook: unwind data at page+%zu  rf_off=%zu  ui_off=%zu  "
+	         "codes=%zu  prolog=%zuB",
+	         rf_off, rf_off, ui_off, codes.size(), prolog_bytes);
+	return true;
+}
+
+#endif
+
 namespace hook
 {
 
@@ -23,7 +216,7 @@ namespace hook
 #endif
 
 	static constexpr size_t kPrologueCap = 64;
-	static constexpr size_t kTrampolineCap = 128;
+	static constexpr size_t kTrampolineCap = 256;
 
 	static ZydisDecoder g_dec;
 	static bool g_dec_ready = false;
@@ -59,6 +252,26 @@ namespace hook
 		log_err("hook: VirtualProtect(%p, %zu, 0x%lX) failed (err %lu)", p, n,
 		        prot, GetLastError());
 		return false;
+	}
+
+	static size_t emit_jmp_indirect(uint8_t *at, void *target)
+	{
+#ifdef _WIN64
+		// FF 25 00 00 00 00  — JMP QWORD PTR [RIP+0]
+		// [RIP+0] immediately follows this 6-byte instruction, holding the
+		// target.
+		at[0] = 0xFF;
+		at[1] = 0x25;
+		at[2] = 0x00;
+		at[3] = 0x00;
+		at[4] = 0x00;
+		at[5] = 0x00;
+		memcpy(at + 6, &target, 8);
+		return 14;
+#else
+		// x86: no RAX capture in prologues, ordinary JMP is fine.
+		return emit_jmp(at, target);
+#endif
 	}
 
 	static size_t emit_jmp(uint8_t *at, void *target)
@@ -214,6 +427,9 @@ namespace hook
 		void *detour = nullptr;
 		void **original = nullptr;
 		uint8_t *trampoline = nullptr;
+#ifdef _WIN64
+		RUNTIME_FUNCTION *rf = nullptr;
+#endif
 		uint8_t saved[kPrologueCap] = {};
 		size_t saved_len = 0;
 		bool installed = false;
@@ -274,6 +490,10 @@ namespace hook
 		uint8_t *tp = tramp;
 		size_t tp_used = 0;
 
+#ifdef _WIN64
+		std::vector<InstrForUnwind> unwind_instrs;
+#endif
+
 		for (int i = 0; i < rec_n; i++)
 		{
 			auto &r = recs[i];
@@ -296,20 +516,78 @@ namespace hook
 				VirtualFree(tramp, 0, MEM_RELEASE);
 				return false;
 			}
+
+#ifdef _WIN64
+			InstrForUnwind ifu;
+			ifu.tramp_off = tp_used;
+			ifu.ins = r.ins;
+			memcpy(ifu.ops, r.ops, sizeof(r.ops));
+			unwind_instrs.push_back(ifu);
+#endif
+
 			r.written = w;
 			tp += w;
 			tp_used += w;
 		}
 
-		size_t jback = emit_jmp(tp, tgt + total);
+		size_t jback = emit_jmp_indirect(tp, tgt + total);
 		tp += jback;
 		tp_used += jback;
 		(void)tp;
+
+		const size_t tramp_code_sz = tp_used;
+
+#ifdef _WIN64
+		const size_t unwind_space_needed =
+		    kRFSize + sizeof(UnwindInfoHdr) +
+		    (kMaxUnwindCodes * sizeof(UnwindCode));
+		const size_t unwind_start = rf_offset_for(tramp_code_sz);
+
+		if (unwind_start + unwind_space_needed > kTrampolineCap)
+		{
+			log_err("hook: %p — no room for unwind data in trampoline page "
+			        "(code=%zu, needed=%zu, cap=%zu)",
+			        h.target, tramp_code_sz, unwind_start + unwind_space_needed,
+			        kTrampolineCap);
+		}
+		else
+		{
+			if (!write_unwind_data(tramp, tramp_code_sz, total, unwind_instrs))
+			{
+				log_warn("hook: %p — unwind data write failed "
+				         "(trampoline unprotected for exception unwind)",
+				         h.target);
+			}
+			else
+			{
+				h.rf = reinterpret_cast<RUNTIME_FUNCTION *>(
+				    tramp + rf_offset_for(tramp_code_sz));
+
+				if (!RtlAddFunctionTable(h.rf, 1,
+				                         reinterpret_cast<DWORD64>(tramp)))
+				{
+					log_warn("hook: %p — RtlAddFunctionTable failed (err %lu)",
+					         h.target, GetLastError());
+					h.rf = nullptr;
+				}
+				else
+				{
+					log_info("hook: %p — RtlAddFunctionTable OK  rf=%p",
+					         h.target, static_cast<void *>(h.rf));
+				}
+			}
+		}
+#endif
 
 		{
 			DWORD old;
 			if (!vprotect(tramp, kTrampolineCap, PAGE_EXECUTE_READ, &old))
 			{
+#ifdef _WIN64
+				if (h.rf)
+					RtlDeleteFunctionTable(h.rf);
+#endif
+
 				VirtualFree(tramp, 0, MEM_RELEASE);
 				return false;
 			}
@@ -363,6 +641,14 @@ namespace hook
 			vprotect(tgt, h.saved_len, old, &dummy);
 		}
 		FlushInstructionCache(GetCurrentProcess(), tgt, h.saved_len);
+#ifdef _WIN64
+		if (h.rf)
+		{
+			RtlDeleteFunctionTable(h.rf);
+			h.rf = nullptr;
+		}
+#endif
+
 		h.installed = false;
 	}
 
