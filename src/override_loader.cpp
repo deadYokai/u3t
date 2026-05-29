@@ -69,6 +69,41 @@ namespace
 
 	static bool safe_read(const void *p, size_t sz)
 	{
+		if (!p || sz == 0)
+			return false;
+
+		MEMORY_BASIC_INFORMATION mbi{};
+
+		if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+			return false;
+
+		if (mbi.State != MEM_COMMIT)
+			return false;
+
+		if (mbi.Protect & PAGE_GUARD)
+			return false;
+
+		if (mbi.Protect & PAGE_NOACCESS)
+			return false;
+
+		const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+		                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+		                       PAGE_EXECUTE_WRITECOPY;
+
+		if (!(mbi.Protect & readable))
+			return false;
+
+		auto start = reinterpret_cast<uintptr_t>(p);
+		auto end = start + sz;
+
+		auto region_end =
+		    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+		return end <= region_end;
+	}
+
+	static bool safe_read_old(const void *p, size_t sz)
+	{
 		return p && !IsBadReadPtr(p, sz);
 	}
 
@@ -154,8 +189,8 @@ namespace
 		void *primary_vptr;
 		memcpy(&primary_vptr, base, sizeof(void *));
 
-		for (size_t off = kUObjSz; off + sizeof(void *) <= /*0xC00*/ 0x2000;
-		     off += 8)
+		for (size_t off = kUObjSz; off + sizeof(void *) <= 0xC00;
+		     off += sizeof(void *))
 		{
 			if (!safe_read(base + off, sizeof(void *)))
 				continue;
@@ -323,7 +358,7 @@ namespace
 			return;
 		}
 
-		log_info("override: Preload '%ls'", path.c_str());
+		// log_info("override: Preload '%ls'", path.c_str());
 
 		auto *rec = override_loader::find(path);
 		if (!rec || rec->bin.empty())
