@@ -1,10 +1,10 @@
 #define WIN32_LEAN_AND_MEAN
-#include <vector>
 #include "config.hpp"
 #include "logs.hpp"
 #include <cctype>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 static std::string trim(const std::string &s)
 {
@@ -187,6 +187,8 @@ bool parse_mod_config(const std::string &path, ModConfig &out)
 		{
 			if (k == "upk_version")
 				out.upk_version = parse_u32(v);
+			else if (k == "license_version")
+				out.license_version = parse_u32(v);
 			else if (k == "name")
 				out.name = parse_str(v);
 			else if (k == "author")

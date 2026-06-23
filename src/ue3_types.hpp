@@ -23,7 +23,7 @@ using FNameNamesArray = TArrayMirror<void *>;
 struct FNameLayout
 {
 #ifdef _WIN64
-	size_t str_off = 20;
+	size_t str_off = 21;
 #else
 	size_t str_off = 12;
 #endif

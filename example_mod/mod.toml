@@ -1,8 +1,5 @@
 name = "ExampleMod"
 version = "1.0.0"
-author = "you"
+author = "deadYokai"
 description = "Replaces UI_Loading.ChaletComprime-CologneEighty with a custom font"
-enabled = true
-
-upk_version = 868
 

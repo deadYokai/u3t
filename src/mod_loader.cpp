@@ -10,70 +10,38 @@
 #include <vector>
 #include <windows.h>
 
-// ---------------------------------------------------------------------------
-// UE3 function pointer typedefs (call convention is __cdecl on both x86/x64
-// for these UObject static methods; the real UE3 source uses VARARGS/cdecl).
-// ---------------------------------------------------------------------------
-
-// UObject* StaticLoadObject(UClass*, UObject* outer, const wchar_t* name,
-//                           const wchar_t* filename, uint32_t flags,
-//                           UPackageMap*, int32_t allowReconcil)
 using StaticLoadObjectFn = void *(__cdecl *)(void *, void *, const wchar_t *,
                                              const wchar_t *, uint32_t, void *,
                                              int32_t);
 
-// UObject* StaticConstructObject(UClass*, UObject* outer, FName,
-//                                uint64_t flags, UObject* tmpl,
-//                                FOutputDevice*, UObject* subroot,
-//                                FObjectInstancingGraph*)
 using StaticConstructObjectFn = void *(__cdecl *)(void *, void *, FNameOnStack,
                                                   uint64_t, void *, void *,
                                                   void *, void *);
 
-// UPackage* CreatePackage(UObject* outer, const wchar_t* name,
-//                         uint32_t remapped)
 using CreatePackageFn = void *(__cdecl *)(void *, const wchar_t *, uint32_t);
 
-// void FName::Init(FName*, const wchar_t* str, EFindName)
 using FNameInitFn = void(__cdecl *)(void *, const wchar_t *, int32_t);
 
-// void FMapPackageFileCache::CachePath(const wchar_t*)
-// Called through vtable — slot resolved at runtime (see register_content).
 using CachePathFn = void(__cdecl *)(void *, const wchar_t *);
 
-// ---------------------------------------------------------------------------
-// Object flags — from UnObjBas.h (DECLARE_UINT64 macros, 64-bit flags)
-// ---------------------------------------------------------------------------
 static constexpr uint64_t kRF_Public = 0x0000000400000000ULL;
 static constexpr uint64_t kRF_Standalone = 0x0008000000000000ULL;
-// RF_Standalone is in the KeepFlags passed to CollectGarbage, so objects
-// with this flag survive every GC cycle without needing RF_RootSet.
 
-// EFindName::FNAME_Add = 1 — find or create the name entry
 static constexpr int32_t kFNAME_Add = 1;
-
-// ---------------------------------------------------------------------------
-// Internal state
-// ---------------------------------------------------------------------------
 
 namespace
 {
 
 	struct SpawnEntry
 	{
-		std::wstring key;        // L"PackageName.ObjectName"
-		std::string class_name;  // narrow UTF-8
+		std::wstring key;
+		std::string class_name;
 		std::wstring package_name;
 		std::wstring object_name;
-		// Written exactly once (first successful spawn), read many times.
-		// InterlockedCompareExchangePointer gives the required acquire/release
-		// semantics on Windows x86/x64 without making the struct non-movable.
+
 		void *spawned = nullptr;
 	};
 
-	// Replace table: exact InName → replacement InName, both as wchar_t
-	// strings. Looked up on every SLO call; must be small (linear scan is fine
-	// for <100).
 	struct ReplaceEntry
 	{
 		std::wstring original;
@@ -83,21 +51,11 @@ namespace
 	std::vector<SpawnEntry> g_spawns;
 	std::vector<ReplaceEntry> g_replaces;
 
-	// Loaded mods (kept for lifetime of the process; not modified after
-	// discover).
 	std::vector<LoadedMod> g_mods;
 
-	// Original SLO, set by install_hooks().
 	static StaticLoadObjectFn g_orig_slo = nullptr;
 
-	// Thread-local reentrancy guard: spawn_object calls StaticConstructObject
-	// and CreatePackage which may internally call SLO. We must not intercept
-	// those.
 	static thread_local bool s_in_spawn = false;
-
-	// ---------------------------------------------------------------------------
-	// Helpers
-	// ---------------------------------------------------------------------------
 
 	static FNameOnStack make_fname(const wchar_t *name)
 	{
@@ -108,14 +66,11 @@ namespace
 		return fn;
 	}
 
-	// Resolve a UClass* by name (searches any package).
-	// Returns nullptr if the class is not loaded yet.
 	static void *find_class(const wchar_t *class_name)
 	{
 		if (!ue3().StaticFindObjectFast)
 			return nullptr;
-		// StaticFindObjectFast(ObjectClass=nullptr [any], Outer=nullptr, Name,
-		//                      bExact=false, bAnyPackage=true, ExclFlags=0)
+
 		using SFOFFn = void *(__cdecl *)(void *, void *, FNameOnStack, int32_t,
 		                                 int32_t, uint64_t);
 		FNameOnStack fn = make_fname(class_name);
@@ -123,20 +78,9 @@ namespace
 		    nullptr, nullptr, fn, 0, 1, 0);
 	}
 
-	// ---------------------------------------------------------------------------
-	// spawn_object — called lazily from hook_SLO on first miss.
-	//
-	// We use an atomic pointer as the cache so that if two threads race on the
-	// first call, at most one actually constructs (the other will see non-null
-	// on its next SLO call and return through the normal fast path via
-	// GObjHash).
-	// ---------------------------------------------------------------------------
 	static void *spawn_object(SpawnEntry &e)
 	{
-		// Double-checked: already spawned?
-		// VolatileRead: any non-null value written by another thread is visible
-		// because InterlockedCompareExchangePointer below issues a full
-		// barrier.
+
 		void *obj = static_cast<void *>(
 		    InterlockedCompareExchangePointer(&e.spawned, nullptr, nullptr));
 		if (obj)
@@ -150,7 +94,6 @@ namespace
 			return nullptr;
 		}
 
-		// 1. Find the class.
 		std::wstring wcls(e.class_name.begin(), e.class_name.end());
 		void *cls = find_class(wcls.c_str());
 		if (!cls)
@@ -162,7 +105,6 @@ namespace
 			return nullptr;
 		}
 
-		// 2. Find or create the package.
 		void *pkg = reinterpret_cast<CreatePackageFn>(ue3().CreatePackage)(
 		    nullptr, e.package_name.c_str(), 0);
 		if (!pkg)
@@ -172,19 +114,11 @@ namespace
 			return nullptr;
 		}
 
-		// 3. Construct the object with class-default values.
-		//    RF_Public | RF_Standalone — visible outside package, survives GC.
 		FNameOnStack obj_name = make_fname(e.object_name.c_str());
 		void *new_obj = reinterpret_cast<StaticConstructObjectFn>(
-		    ue3().StaticConstructObject)(cls,       // InClass
-		                                 pkg,       // InOuter
-		                                 obj_name,  // InName
-		                                 kRF_Public |
-		                                     kRF_Standalone,  // InFlags
-		                                 nullptr,   // InTemplate  (use CDO)
-		                                 nullptr,   // Error       (use GError)
-		                                 nullptr,   // SubobjectRoot
-		                                 nullptr);  // InstanceGraph
+		    ue3().StaticConstructObject)(cls, pkg, obj_name,
+		                                 kRF_Public | kRF_Standalone, nullptr,
+		                                 nullptr, nullptr, nullptr);
 
 		if (!new_obj)
 		{
@@ -203,34 +137,22 @@ namespace
 		}
 
 		log_info("spawn: created %s.%ls  class=%s  obj=%p",
-		         e.class_name.c_str(),   // narrow class name
-		         e.object_name.c_str(),  // wide for %ls
+		         e.class_name.c_str(), e.object_name.c_str(),
 		         e.class_name.c_str(), new_obj);
 		return new_obj;
 	}
 
-	// ---------------------------------------------------------------------------
-	// SLO hook
-	// ---------------------------------------------------------------------------
-
-	// Extract the base "Package.Object" key from a potentially long path like
-	// "Outer.Group.Object". We only look at the last two dot-separated segments
-	// for the spawn lookup because StaticConstructObject registers the object
-	// under its direct Outer (the package), not any intermediate group.
-	//
-	// Returns an empty wstring if the name has no dot (i.e. it is a raw package
-	// name request — not our concern).
 	static std::wstring base_key(const wchar_t *name)
 	{
 		const wchar_t *last_dot = wcsrchr(name, L'.');
 		if (!last_dot)
 			return {};
-		// Walk back one more dot to get "Package.Object"
+
 		std::wstring full(name);
 		size_t second = full.rfind(L'.', last_dot - name - 1);
 		if (second == std::wstring::npos)
-			return full;                 // already "Package.Object"
-		return full.substr(second + 1);  // "Package.Object" suffix
+			return full;
+		return full.substr(second + 1);
 	}
 
 	static void *__cdecl
@@ -242,25 +164,19 @@ namespace
 			return g_orig_slo(InClass, InOuter, Name, Filename, LoadFlags,
 			                  Sandbox, bAllowReconciliation);
 
-		// --- Replace patch: exact match on full InName
-		// -------------------------
 		for (const auto &r : g_replaces)
 		{
 			if (r.original == Name)
 			{
 				log_info("slo_hook: replace '%ls' -> '%ls'", Name,
 				         r.replacement.c_str());
-				// Keep InOuter, InClass, LoadFlags from caller — only the name
-				// changes.  ResolveName inside SLO will re-derive the outer
-				// from the new name string.
+
 				return g_orig_slo(InClass, nullptr, r.replacement.c_str(),
 				                  nullptr, LoadFlags, Sandbox,
 				                  bAllowReconciliation);
 			}
 		}
 
-		// --- Spawn patch: match last "Package.Object" segment
-		// ------------------
 		std::wstring key = base_key(Name);
 		if (!key.empty())
 		{
@@ -269,7 +185,6 @@ namespace
 				if (e.key != key)
 					continue;
 
-				// Fast path: already constructed.
 				void *obj = InterlockedCompareExchangePointer(&e.spawned,
 				                                              nullptr, nullptr);
 				if (obj)
@@ -278,7 +193,7 @@ namespace
 					         obj);
 					return obj;
 				}
-				// Slow path: first call — construct the object.
+
 				s_in_spawn = true;
 				obj = spawn_object(e);
 				s_in_spawn = false;
@@ -288,8 +203,7 @@ namespace
 					         obj);
 					return obj;
 				}
-				// Construction failed; fall through to original so the game
-				// at least gets its normal error handling.
+
 				log_warn("slo_hook: spawn failed for '%ls', falling through",
 				         Name);
 				break;
@@ -368,10 +282,6 @@ namespace
 			out.push_back(std::move(mods[i]));
 		return out;
 	}
-
-	// ---------------------------------------------------------------------------
-	// Discover helpers
-	// ---------------------------------------------------------------------------
 
 	static void discover_mods(const std::wstring &exe_dir)
 	{
@@ -485,18 +395,11 @@ namespace
 		log_info("register_content: CachePath('%ls')", path.c_str());
 	}
 
-}  // anonymous namespace
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+}  // namespace
 
 namespace mod_loader
 {
 
-	// Step 1: Call from init_thread before ue3_resolve().
-	// Scans Mods/ directory, parses mod.toml files, builds spawn/replace
-	// tables. Does NOT call any UE3 functions.
 	void discover()
 	{
 		discover_mods(get_exe_dir());
@@ -527,15 +430,13 @@ namespace mod_loader
 		{
 			for (const auto &rel : lm.cfg.content_paths)
 			{
-				// content_paths are relative to the mod dir (e.g. "Content\\")
+
 				std::wstring full = lm.dir_w + L"\\" + to_wide(rel);
 				cache_content_path(cache, full);
 			}
 		}
 	}
 
-	// Step 3: Call from init_thread after ue3_resolve().
-	// Registers the StaticLoadObject hook. Only one hook needed — no SFOF hook.
 	void install_hooks()
 	{
 		if (!ue3().StaticLoadObject)
@@ -544,7 +445,7 @@ namespace mod_loader
 			    "mod_loader: StaticLoadObject not resolved — hook skipped");
 			return;
 		}
-		// Only install if there is actually something to intercept.
+
 		if (g_spawns.empty() && g_replaces.empty())
 		{
 			log_info("mod_loader: no spawn/replace patches — SLO hook skipped");
@@ -557,8 +458,6 @@ namespace mod_loader
 		         g_spawns.size(), g_replaces.size());
 	}
 
-	// Optional: used by other modules that need to query the replace table
-	// (e.g., a future UI module).
 	bool find_replace(const std::wstring &orig, std::wstring &out)
 	{
 		for (const auto &r : g_replaces)

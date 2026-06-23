@@ -144,8 +144,8 @@ static int __fastcall dbg_FUN_14002b990(uint64_t param_1, char *param_2,
 
 	uint64_t ghidra_addr = (param_1 - g_runtimeBase) + kGhidraImageBase;
 
-	log_err(">> FUN_14002b990 runtime=0x%llX ghidra=0x%llX flags=0x%llX",
-	         param_1, ghidra_addr, param_4);
+	log_err(">> CrashLogger runtime=0x%llX ghidra=0x%llX flags=0x%llX", param_1,
+	        ghidra_addr, param_4);
 
 	int r = g_orig_FUN_14002b990(param_1, param_2, param_3, param_4);
 

@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include "hook.hpp"
+#include "linker_layout.hpp"
 #include "logs.hpp"
 #include "mod_loader.hpp"
 #include "override_loader.hpp"
@@ -91,6 +92,17 @@ static DWORD WINAPI init_thread(LPVOID)
 	mod_loader::install_hooks();
 
 	log_info("init: scanning binary overrides");
+
+	{
+		LinkerLayout li;
+		if (!resolve_linker_layout(li, ue3().FNameInit))
+		{
+			log_err("init_thread: linker layout resolution failed — binary "
+			        "overrides disabled");
+			return 1;
+		}
+	}
+
 	override_loader::discover(mod_loader::loaded_mods());
 
 	log_info("init: installing Preload hook");

@@ -5,20 +5,15 @@
 
 namespace override_loader
 {
-	struct ImpEntry
-	{
-		int32_t mod_index;
-		std::string path;
-	};
-
 	struct OverrideRecord
 	{
 		std::wstring key;
 		std::vector<uint8_t> bin;
-		std::vector<std::pair<int32_t, void *>> resolved_imports;
-		bool imports_resolved;
-		std::vector<ImpEntry> imp_entries;
-		int32_t upk_version = 684;
+		int32_t upk_version = 801;
+		int32_t license_version = 0;
+		std::vector<std::string> tool_names;
+		std::vector<int32_t> name_remap;
+		bool name_remap_ready = false;
 	};
 
 	void discover(const std::vector<LoadedMod> &mods);
