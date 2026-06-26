@@ -1,5 +1,3 @@
-
-
 #pragma once
 #include "FArchive.hpp"
 #include "FName.hpp"
@@ -40,6 +38,16 @@ static constexpr ptrdiff_t kUObj_ObjectArchetype =
 static constexpr ptrdiff_t kUObj_Size = sizeof(UObject_Mirror);
 static constexpr ptrdiff_t kUObj_MinRead =
     offsetof(UObject_Mirror, Name) + sizeof(FName);
+
+static constexpr ptrdiff_t kLinker_LinkerRoot = 0x5C;
+static_assert(kLinker_LinkerRoot == sizeof(UObject_Mirror),
+              "LinkerRoot must sit immediately after the UObject base");
+
+inline void *linker_root(void *linker)
+{
+	return *reinterpret_cast<void **>(static_cast<uint8_t *>(linker) +
+	                                  kLinker_LinkerRoot);
+}
 
 inline uint8_t *linker_base(void *linker)
 {

@@ -1,8 +1,10 @@
+#include <memory>
+#include <unordered_set>
 #define WIN32_LEAN_AND_MEAN
-#include "override_loader.hpp"
 #include "hook.hpp"
 #include "linker_layout.hpp"
 #include "logs.hpp"
+#include "override_loader.hpp"
 #include "pattern_scanner.hpp"
 #include "ue3_types.hpp"
 #include "util.hpp"
@@ -253,14 +255,19 @@ static void debug_dump_chain(const void *obj)
 	}
 }
 
-static std::wstring get_uobj_path(const void *obj)
+static std::wstring get_uobj_path(const void *obj, void *linker)
 {
 	if (!obj || !ue3().FNameNames || !safe_read(obj, sizeof(UObject_Mirror)))
 		return {};
 
+	const void *root =
+	    (linker && safe_read(linker_root(linker), sizeof(UObject_Mirror)))
+	        ? linker_root(linker)
+	        : nullptr;
+
 	std::vector<std::wstring> parts;
 	const void *cur = obj;
-	for (int d = 0; d < 8 && cur; ++d)
+	for (int d = 0; d < 8 && cur && cur != root; ++d)
 	{
 		if (!safe_read(cur, sizeof(UObject_Mirror)))
 			break;
@@ -270,6 +277,8 @@ static std::wstring get_uobj_path(const void *obj)
 		std::wstring seg = fname_str(nm.Index);
 		if (seg.empty())
 			break;
+		if (nm.Number != 0)
+			seg += L"_" + std::to_wstring(nm.Number - 1);
 		parts.push_back(seg);
 		cur = uobj_outer(cur);
 	}
@@ -277,6 +286,16 @@ static std::wstring get_uobj_path(const void *obj)
 		return {};
 
 	std::wstring path;
+	if (root)
+	{
+		const FName pn = uobj_name(root);
+		if (pn.Index >= 0 && pn.Index < ue3().FNameNames->Num)
+		{
+			path = fname_str(pn.Index);
+			if (pn.Number != 0)
+				path += L"_" + std::to_wstring(pn.Number - 1);
+		}
+	}
 	for (auto it = parts.rbegin(); it != parts.rend(); ++it)
 	{
 		if (!path.empty())
@@ -425,41 +444,55 @@ static const char *kPat_Preload =
     "48 8b c4 55 56 57 41 54 41 55 41 56 41 57 48 81 ec a0 00 00 00 48 c7 44 "
     "24 60 fe ff ff ff";
 
-static void __cdecl hooked_Preload(ULinkerLoad_Mirror *linker,
+static inline void orig_preload(ULinkerLoad_Mirror *linker, UObject_Mirror *obj)
+{
+	if (linker && g_orig_Preload)
+		g_orig_Preload(
+		    reinterpret_cast<ULinkerLoad_Mirror *>(linker_farchive(linker)),
+		    obj);
+}
+
+static void __cdecl hooked_Preload(ULinkerLoad_Mirror *farchive,
                                    UObject_Mirror *obj)
 {
+	ULinkerLoad_Mirror *linker =
+	    farchive
+	        ? reinterpret_cast<ULinkerLoad_Mirror *>(
+	              reinterpret_cast<uint8_t *>(farchive) - kLinker_FArchiveOff)
+	        : nullptr;
+
 	if (!linker_layout().valid || !linker || !obj || !ue3().FNameNames)
 	{
-		if (linker && g_orig_Preload)
-			g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
 	if (!safe_read(obj, sizeof(UObject_Mirror)))
 	{
-		g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
 	if (!uobj_has_flag(obj, kRF_NeedLoad))
 	{
-		g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
-	log_info("obj=%p _Linker=%p linker=%p outer=%p class=%p", obj, obj->_Linker,
-	         linker, obj->Outer, obj->Class);
+	// log_info("obj=%p _Linker=%p linker=%p outer=%p class=%p", obj,
+	// obj->_Linker,
+	//          linker, obj->Outer, obj->Class);
 	if (obj->_Linker != linker)
 	{
-		g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
-	std::wstring path = get_uobj_path(obj);
+	std::wstring path = get_uobj_path(obj, linker);
 
 	if (path.empty())
 	{
-		g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
@@ -467,7 +500,10 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *linker,
 
 	if (!rec || rec->bin.empty())
 	{
-		g_orig_Preload(linker, obj);
+		// static std::unordered_set<std::wstring> s_missed;
+		// if (s_missed.insert(path).second)
+		// 	log_info("override: NO MATCH for path='%ls'", path.c_str());
+		orig_preload(linker, obj);
 		return;
 	}
 
@@ -486,9 +522,9 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *linker,
 
 	if (!exp)
 	{
-		log_warn("override: '%ls' — bad _LinkerIndex %td, passing through",
+		log_warn("override: '%ls' — bad _LinkerIndex %d, passing through",
 		         path.c_str(), idx);
-		g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
@@ -502,7 +538,7 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *linker,
 	{
 		log_warn("override: '%ls' has EF_ScriptPatcherExport — passing through",
 		         path.c_str());
-		g_orig_Preload(linker, obj);
+		orig_preload(linker, obj);
 		return;
 	}
 
@@ -575,6 +611,61 @@ static std::wstring find_namemap_for_key(const std::wstring &key,
 	return {};
 }
 
+static void scan_package_dir(const std::wstring &pkg_dir,
+                             const std::wstring &pkg_name, const LoadedMod &lm)
+{
+	std::shared_ptr<std::vector<std::string>> names;
+	{
+		std::wstring nm = pkg_dir + L"\\" + pkg_name + L".namemap";
+		if (GetFileAttributesW(nm.c_str()) != INVALID_FILE_ATTRIBUTES)
+		{
+			auto v = parse_namemap(nm);
+			if (!v.empty())
+				names =
+				    std::make_shared<std::vector<std::string>>(std::move(v));
+		}
+	}
+	if (!names)
+		log_warn("override: no .namemap in '%ls' — FName remap disabled",
+		         pkg_dir.c_str());
+
+	WIN32_FIND_DATAW fd{};
+	HANDLE h = FindFirstFileW((pkg_dir + L"\\*.bin").c_str(), &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do
+	{
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+		std::wstring stem = file_stem(fd.cFileName);
+		if (stem.empty())
+			continue;
+
+		auto bin = read_file(pkg_dir + L"\\" + fd.cFileName);
+		if (bin.empty())
+		{
+			log_warn("override: read failed '%ls'", fd.cFileName);
+			continue;
+		}
+
+		std::wstring key = pkg_name + L"." + stem;
+		override_loader::OverrideRecord rec;
+		rec.key = key;
+		rec.bin = std::move(bin);
+		rec.upk_version =
+		    lm.cfg.upk_version ? int32_t(lm.cfg.upk_version) : 801;
+		rec.license_version =
+		    lm.cfg.license_version ? int32_t(lm.cfg.license_version) : 0;
+		if (names)
+			rec.tool_names = *names;
+		g_overrides[key] = std::move(rec);
+		log_info("override: registered '%ls'  bin=%zu names=%zu mod='%s'",
+		         key.c_str(), g_overrides[key].bin.size(),
+		         g_overrides[key].tool_names.size(), lm.cfg.name.c_str());
+	} while (FindNextFileW(h, &fd));
+	FindClose(h);
+}
+
 static void scan_mod(const LoadedMod &lm)
 {
 	std::wstring ov_dir;
@@ -591,47 +682,16 @@ static void scan_mod(const LoadedMod &lm)
 		return;
 
 	WIN32_FIND_DATAW fd{};
-	HANDLE h = FindFirstFileW((ov_dir + L"\\*.bin").c_str(), &fd);
+	HANDLE h = FindFirstFileW((ov_dir + L"\\*").c_str(), &fd);
 	if (h == INVALID_HANDLE_VALUE)
 		return;
-
 	do
 	{
-		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
 			continue;
-		std::wstring key = file_stem(fd.cFileName);
-		if (key.empty())
+		if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
 			continue;
-
-		auto bin = read_file(ov_dir + L"\\" + fd.cFileName);
-		if (bin.empty())
-		{
-			log_warn("override: read failed '%ls'", fd.cFileName);
-			continue;
-		}
-
-		std::wstring nm_path = find_namemap_for_key(key, ov_dir);
-
-		override_loader::OverrideRecord rec;
-		rec.key = key;
-		rec.bin = std::move(bin);
-		rec.upk_version =
-		    lm.cfg.upk_version ? int32_t(lm.cfg.upk_version) : 801;
-		rec.license_version =
-		    lm.cfg.license_version ? int32_t(lm.cfg.license_version) : 0;
-
-		if (!nm_path.empty())
-			rec.tool_names = parse_namemap(nm_path);
-		else
-			log_warn("override: no .namemap for '%ls' — FName remap disabled",
-			         key.c_str());
-
-		g_overrides[key] = std::move(rec);
-		log_info("override: registered '%ls'  bin=%zu bytes  namemap=%zu names "
-		         " mod='%s'",
-		         key.c_str(), g_overrides[key].bin.size(),
-		         g_overrides[key].tool_names.size(), lm.cfg.name.c_str());
-
+		scan_package_dir(ov_dir + L"\\" + fd.cFileName, fd.cFileName, lm);
 	} while (FindNextFileW(h, &fd));
 	FindClose(h);
 }
