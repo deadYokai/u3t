@@ -8,8 +8,8 @@
 #include <string.h>
 
 static constexpr ptrdiff_t kLinker_FArchiveOff = 0x1C4;
-static constexpr ptrdiff_t kLinker_Loader = 0x4A4;
-static constexpr ptrdiff_t kLinker_OriginalLoader = 0x514;
+static constexpr ptrdiff_t kLinker_Loader = 0x668;
+static constexpr ptrdiff_t kLinker_OriginalLoader = 0x6d8;
 
 static constexpr ptrdiff_t kLinker_NameMap_Data = kLinker_FArchiveOff - 0xA8;
 static constexpr ptrdiff_t kLinker_NameMap_Num = kLinker_FArchiveOff - 0xA0;
