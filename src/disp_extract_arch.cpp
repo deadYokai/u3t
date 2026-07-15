@@ -78,6 +78,7 @@ namespace dxa
 		bool scan(const void *begin, const void *end, Mode mode, int slot_index,
 		          int scale, void **&outg, ptrdiff_t &outv, int window)
 		{
+			bool is_64bit = sizeof(void *) == 8;
 			ZydisDecoder dec = make_decoder();
 			const uint8_t *p = static_cast<const uint8_t *>(begin);
 			const uint8_t *e = static_cast<const uint8_t *>(end);
@@ -93,6 +94,8 @@ namespace dxa
 			int64_t fpOff[16];
 			void *fpGlob[16];
 			int64_t fpFld[16];
+
+			int PS = is_64bit ? 8 : 4;
 
 			auto clear = [&](int r)
 			{
@@ -169,6 +172,17 @@ namespace dxa
 						{
 							g_from[dst] = reinterpret_cast<void *>(g);
 						}
+						else if (!is_64bit &&
+						         ops[1].mem.base == ZYDIS_REGISTER_NONE &&
+						         ops[1].mem.index == ZYDIS_REGISTER_NONE &&
+						         ops[1].mem.disp.has_displacement)
+						{
+							void *abs_glob = reinterpret_cast<void *>(
+							    static_cast<uintptr_t>(ops[1].mem.disp.value));
+							g_from[dst] = abs_glob;
+							vtKind[dst] = PV_GLOB;
+							vtGlob[dst] = abs_glob;
+						}
 						else if (ops[1].mem.base != ZYDIS_REGISTER_NONE &&
 						         ops[1].mem.base != ZYDIS_REGISTER_RIP &&
 						         ops[1].mem.index == ZYDIS_REGISTER_NONE)
@@ -216,22 +230,36 @@ namespace dxa
 				int64_t coff = 0;
 				void *cg = nullptr;
 				int64_t cf = SENT;
+
 				if (in.mnemonic == ZYDIS_MNEMONIC_CALL &&
 				    in.operand_count_visible >= 1)
 				{
-					if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-					    ops[0].mem.base != ZYDIS_REGISTER_NONE &&
-					    ops[0].mem.base != ZYDIS_REGISTER_RIP &&
-					    ops[0].mem.index == ZYDIS_REGISTER_NONE &&
-					    ops[0].mem.disp.has_displacement)
+					if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
 					{
-						int b = gpr_idx(ops[0].mem.base);
-						if (b >= 0 && vtKind[b] != PV_NONE)
+						if (ops[0].mem.base != ZYDIS_REGISTER_NONE &&
+						    ops[0].mem.base != ZYDIS_REGISTER_RIP &&
+						    ops[0].mem.index == ZYDIS_REGISTER_NONE &&
+						    ops[0].mem.disp.has_displacement)
 						{
-							ck = vtKind[b];
-							coff = ops[0].mem.disp.value;
-							cg = vtGlob[b];
-							cf = vtFld[b];
+							int b = gpr_idx(ops[0].mem.base);
+							if (b >= 0 && vtKind[b] != PV_NONE)
+							{
+								ck = vtKind[b];
+								coff = ops[0].mem.disp.value;
+								cg = vtGlob[b];
+								cf = vtFld[b];
+							}
+						}
+						else if (!is_64bit &&
+						         ops[0].mem.base == ZYDIS_REGISTER_NONE &&
+						         ops[0].mem.index == ZYDIS_REGISTER_NONE &&
+						         ops[0].mem.disp.has_displacement)
+						{
+							ck = PV_GLOB;
+							coff = 0;
+							cg = reinterpret_cast<void *>(
+							    static_cast<uintptr_t>(ops[0].mem.disp.value));
+							cf = SENT;
 						}
 					}
 					else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
@@ -267,6 +295,7 @@ namespace dxa
 						return true;
 					}
 				}
+
 				p += in.length;
 			}
 			return false;
