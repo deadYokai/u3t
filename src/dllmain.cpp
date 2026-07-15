@@ -1,18 +1,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include "hook.hpp"
-#include "linker_layout.hpp"
 #include "logs.hpp"
 #include "mod_loader.hpp"
 #include "override_loader.hpp"
-#include "ue3_types.hpp"
+#include "ue3_layout.hpp"
 #include "util.hpp"
 #include <unknwn.h>
 #include <windows.h>
 
-#include "debug.hpp"
-
 static HMODULE g_sys_di8 = nullptr;
 static FARPROC g_real_di8 = nullptr;
+static HMODULE g_hmod = nullptr;
 
 static HMODULE load_system_dinput8()
 {
@@ -61,57 +59,57 @@ static void init_dinput8()
 
 static DWORD WINAPI init_thread(LPVOID)
 {
+	logs::init(get_exe_dir());
+	SYSTEMTIME st{};
+	GetLocalTime(&st);
+
+	log_info("CU3ML mod loader (%s build)",
+	         sizeof(void *) == 8 ? "x64" : "x86");
+
+	log_info("log  %04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay,
+	         st.wHour, st.wMinute, st.wSecond);
+
+	log_info("module = %p", static_cast<void *>(g_hmod));
+
+	init_dinput8();
+
 	log_info("init_thread: discovering mods");
 	mod_loader::discover();
 
-	log_info("init_thread: resolving UE3 addresses");
+	log_info("init_thread: resolving UE3 layout");
 	if (!ue3_resolve(ue3()))
 	{
-		log_err("init_thread: critical UE3 addresses not found — aborting");
+		log_err("init_thread: UE3 layout not resolved — aborting");
 		return 1;
 	}
-	log_info("init_thread: FNameInit             = %p", ue3().FNameInit);
-	log_info("init_thread: StaticFindObjectFast  = %p",
-	         ue3().StaticFindObjectFast);
-	log_info("init_thread: StaticLoadObject      = %p", ue3().StaticLoadObject);
-	log_info("init_thread: StaticConstructObject = %p",
-	         ue3().StaticConstructObject);
-	log_info("init_thread: CreatePackage         = %p", ue3().CreatePackage);
-	log_info("init_thread: GPackageFileCache     = %p",
-	         static_cast<void *>(ue3().GPackageFileCache));
-	if (ue3().FNameNames)
-		log_info("init_thread: FNameNames            = %p  (Num=%d)",
-		         static_cast<void *>(ue3().FNameNames), ue3().FNameNames->Num);
-	else
-		log_warn("init_thread: FNameNames            = NULL");
+
+	const UE3Layout &L = ue3();
+	log_info("init_thread: FNameInit            = %p", L.FNameInit);
+	log_info("init_thread: StaticFindObjectFast = %p", L.StaticFindObjectFast);
+	log_info("init_thread: StaticLoadObject     = %p", L.StaticLoadObject);
+	log_info("init_thread: Preload              = %p", L.Preload);
+	log_info("init_thread: GPackageFileCache    = %p",
+	         static_cast<void *>(L.GPackageFileCache));
+	log_info("init_thread: FName::Names         = %p  (str_off=%zu wf=%d)",
+	         static_cast<void *>(L.FNameNamesArr), L.name.str_off,
+	         (int)L.name.with_flags);
+	log_info("init_thread: FArchive slots       = "
+	         "Serialize=%d Tell=%d Seek=%d Precache=%d SerializeName=%d "
+	         "(validated=%d)",
+	         L.ar.Serialize, L.ar.Tell, L.ar.Seek, L.ar.Precache,
+	         L.ar.SerializeName, (int)L.ar.validated);
 
 	log_info("init_thread: registering content paths");
 	mod_loader::register_content();
 
-	log_info("init_thread: installing SLO hook");
+	log_info("init_thread: installing redirect (SLO) hook");
 	mod_loader::install_hooks();
 
-	log_info("init: scanning binary overrides");
-
-	{
-		LinkerLayout li;
-		if (!resolve_linker_layout(li, ue3().FNameInit))
-		{
-			log_err("init_thread: linker layout resolution failed — binary "
-			        "overrides disabled");
-			return 1;
-		}
-	}
-
+	log_info("init_thread: discovering + installing overrides (Preload hook)");
 	override_loader::discover(mod_loader::loaded_mods());
-
-	log_info("init: installing Preload hook");
 	override_loader::install_hooks();
 
-	log_info("init: installing debug hooks");
-	debug::install_linker_debug_hooks();
-
-	log_info("init: committing hooks");
+	log_info("init_thread: committing hooks");
 	hook::install_all();
 
 	log_info("init_thread: ready");
@@ -120,19 +118,11 @@ static DWORD WINAPI init_thread(LPVOID)
 
 extern "C" BOOL WINAPI DllMain(HMODULE hmod, DWORD reason, LPVOID)
 {
-	SYSTEMTIME st{};
-	GetLocalTime(&st);
 	switch (reason)
 	{
 		case DLL_PROCESS_ATTACH:
 			DisableThreadLibraryCalls(hmod);
-			logs::init(get_exe_dir());
-			log_info("U3T mod loader (%s build)",
-			         sizeof(void *) == 8 ? "x64" : "x86");
-			log_info("log  %04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth,
-			         st.wDay, st.wHour, st.wMinute, st.wSecond);
-			log_info("module = %p", static_cast<void *>(hmod));
-			init_dinput8();
+			g_hmod = hmod;
 			CreateThread(nullptr, 0, init_thread, nullptr, 0, nullptr);
 			break;
 

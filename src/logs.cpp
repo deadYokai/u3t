@@ -1,67 +1,89 @@
+#include <atomic>
 #define WIN32_LEAN_AND_MEAN
 #include "logs.hpp"
 #include "util.hpp"
 #include <cstdarg>
 #include <cstdio>
-#include <fstream>
-#include <mutex>
+#include <cstring>
+
 #include <windows.h>
 
 namespace logs
 {
-
-	struct Logger
-	{
-		std::ofstream file;
-		std::mutex mtx;
-	};
-
-	static Logger *g_logger = nullptr;
+	static HANDLE g_file = INVALID_HANDLE_VALUE;
+	static SRWLOCK g_lock = SRWLOCK_INIT;
+	static std::atomic<bool> g_initialized{false};
 
 	void init(const std::wstring &exe_dir)
 	{
-		std::string dir = to_narrow(exe_dir);
-		char name[MAX_PATH * 4]{};
-		snprintf(name, sizeof(name), "%s\\dinput8.log", dir.c_str());
-
-		auto *lg = new Logger();
-		lg->file.open(name, std::ios::trunc | std::ios::out);
-		if (!lg->file.is_open())
+		AcquireSRWLockExclusive(&g_lock);
+		if (!g_initialized)
 		{
-			delete lg;
-			return;
+			std::wstring path = exe_dir + L"\\dinput8.log";
+			HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+			                       nullptr, CREATE_ALWAYS,
+			                       FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h != INVALID_HANDLE_VALUE)
+			{
+				g_file = h;
+				g_initialized = true;
+			}
 		}
-		g_logger = lg;
+		ReleaseSRWLockExclusive(&g_lock);
 	}
 
 	void raw_write(const char *s)
 	{
-		if (!g_logger || !g_logger->file.is_open())
+		if (!g_initialized || !s)
 			return;
-		std::lock_guard<std::mutex> lk(g_logger->mtx);
-		g_logger->file << s;
-		g_logger->file.flush();
+
+		AcquireSRWLockExclusive(&g_lock);
+		if (g_file != INVALID_HANDLE_VALUE)
+		{
+			size_t n = strlen(s);
+			if (n)
+			{
+				DWORD wrote = 0;
+				WriteFile(g_file, s, static_cast<DWORD>(n), &wrote, nullptr);
+			}
+		}
+		ReleaseSRWLockExclusive(&g_lock);
 	}
 
 	void write_line(const char *level, const char *msg)
 	{
-		if (!g_logger || !g_logger->file.is_open())
-			return;
 		char line[4096];
 		snprintf(line, sizeof(line), "[%s] %s\n", level, msg);
-		std::lock_guard<std::mutex> lk(g_logger->mtx);
-		g_logger->file << line;
-		g_logger->file.flush();
+		raw_write(line);
+	}
+
+	static int format_guarded(char *buf, size_t cap, const char *fmt,
+	                          va_list ap)
+	{
+		__try
+		{
+			return vsnprintf_s(buf, cap, _TRUNCATE, fmt, ap);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			if (cap)
+				buf[0] = '\0';
+			return -1;
+		}
 	}
 
 	std::string vfmt(const char *fmt, ...)
 	{
 		char buf[2048];
+		buf[0] = '\0';
+
 		va_list ap;
 		va_start(ap, fmt);
-		vsnprintf(buf, sizeof(buf), fmt, ap);
+		int len = format_guarded(buf, sizeof(buf), fmt, ap);
 		va_end(ap);
-		return buf;
+
+		(void)len;
+		return std::string(buf);
 	}
 
 }  // namespace logs

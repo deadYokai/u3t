@@ -47,3 +47,11 @@ TMGS_NoMipmaps
 UI_Loading
 UI_Loading_SF_LOC_INT
 YPadding
+PF_A8R8G8B8
+SRGB
+StartU
+StartV
+USize
+VSize
+TextureIndex
+VerticalOffset

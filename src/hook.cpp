@@ -254,26 +254,6 @@ namespace hook
 		return false;
 	}
 
-	static size_t emit_jmp_indirect(uint8_t *at, void *target)
-	{
-#ifdef _WIN64
-		// FF 25 00 00 00 00  — JMP QWORD PTR [RIP+0]
-		// [RIP+0] immediately follows this 6-byte instruction, holding the
-		// target.
-		at[0] = 0xFF;
-		at[1] = 0x25;
-		at[2] = 0x00;
-		at[3] = 0x00;
-		at[4] = 0x00;
-		at[5] = 0x00;
-		memcpy(at + 6, &target, 8);
-		return 14;
-#else
-		// x86: no RAX capture in prologues, ordinary JMP is fine.
-		return emit_jmp(at, target);
-#endif
-	}
-
 	static size_t emit_jmp(uint8_t *at, void *target)
 	{
 #ifdef _WIN64
@@ -291,6 +271,26 @@ namespace hook
 		at[0] = 0xE9;
 		memcpy(at + 1, &rel, 4);
 		return 5;
+#endif
+	}
+
+	static size_t emit_jmp_indirect(uint8_t *at, void *target)
+	{
+#ifdef _WIN64
+		// FF 25 00 00 00 00  — JMP QWORD PTR [RIP+0]
+		// [RIP+0] immediately follows this 6-byte instruction, holding the
+		// target.
+		at[0] = 0xFF;
+		at[1] = 0x25;
+		at[2] = 0x00;
+		at[3] = 0x00;
+		at[4] = 0x00;
+		at[5] = 0x00;
+		memcpy(at + 6, &target, 8);
+		return 14;
+#else
+		// x86: no RAX capture in prologues, ordinary JMP is fine.
+		return emit_jmp(at, target);
 #endif
 	}
 

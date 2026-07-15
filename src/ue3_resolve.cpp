@@ -1,240 +1,248 @@
-#define WIN32_LEAN_AND_MEAN
-#include "logs.hpp"
-#include "pattern_scanner.hpp"
-#include "ue3_types.hpp"
+#include "ue3_layout.hpp"
+
+#include "anchor.hpp"
+#include "disp_extract.hpp"
+#include "disp_extract_arch.hpp"
+
+#include <cstdint>
 #include <cstring>
-#include <psapi.h>
-#include <windows.h>
+#include <vector>
 
-static const char *kPat_StaticFindObjectFast =
-#ifdef _WIN64
-    "48 89 5c 24 08 48 89 74 24 10 4c 89 44 24 18 57 48 83 ec 30 83 3d e1 ff "
-    "74 01 00 41 8b d9 48 8b fa 48 8b f1";
-#else
-    "55 8B EC 51 53 8B 5D ? 56 8B 75 ?";
-#endif
+#include "logs.hpp"
 
-static const char *kPat_StaticLoadObject =
-#ifdef _WIN64
-    "48 8b c4 4c 89 48 20 48 89 50 10 48 89 48 08 53 56 57 48 81 ec f0 00 00 "
-    "00";
-#else
-    "55 8B EC 83 EC ? 53 56 57 8B 7D ?";
-#endif
+static UE3Layout g_ue3;
 
-static const char *kPat_StaticConstructObject =
-#ifdef _WIN64
-    "48 8b c4 4c 89 40 18 57 41 54 41 55 48 83 ec 70 48 c7 44 24 50 fe ff ff "
-    "ff 48 89 58 08 48 89 68 10 48 89 70 20 4d 8b e1 48 8b da 48 8b f1 48 8b "
-    "bc 24 c8 00 00 00";
-#else
-    "55 8B EC 83 EC ? 53 56 57 FF 75 ?";
-#endif
+UE3Layout &ue3() { return g_ue3; }
 
-static const char *kPat_CreatePackage =
-#ifdef _WIN64
-    "48 8b c4 48 89 48 08 53 55 56 57 41 54";
-#else
-    "55 8B EC 8B 45 08 85 C0 75 ?";
-#endif
-
-static const char *kPat_FNameInit =
-#ifdef _WIN64
-    "40 55 56 57 41 56 48 81 EC C8 0C 00 00";
-#else
-    "55 8B EC 83 EC 18 53 56 8B 75 08 85 F6";
-#endif
-
-static const char *kPat_GetPackageLinker =
-#ifdef _WIN64
-    "40 53 56 57 41 54 41 55 41 56 41 57 48 81 ec d0 02 00 00 48 c7 84 24 b8 "
-    "00 00 00 fe ff ff ff 48 8b 05 ?? ?? ?? ??";
-#else
-    "55 8B EC 83 EC ? 53 56 57 8B 75 08";
-#endif
-
-#ifdef _WIN64
-static constexpr size_t kStrOffCandidates[] = {16, 20, 24};
-#else
-static constexpr size_t kStrOffCandidates[] = {8, 12, 16};
-#endif
-
-static bool validate_fnames(void *cand, bool &out_wf, size_t &out_str_off)
+namespace
 {
-	auto *a = static_cast<FNameNamesArray *>(cand);
-	if (!a->Data || a->Num < 100 || a->Max < a->Num)
-		return false;
-	if (IsBadReadPtr(a->Data, sizeof(void *) * 4))
-		return false;
+	using anchor::ModuleImage;
+	constexpr ptrdiff_t PS = static_cast<ptrdiff_t>(sizeof(void *));
 
-	void *e0 = a->Data[0];
-	if (!e0 || IsBadReadPtr(e0, 64))
-		return false;
-
-	for (size_t off : kStrOffCandidates)
+	void *only(const std::vector<void *> &v, const char *what)
 	{
-		const char *s =
-		    reinterpret_cast<const char *>(static_cast<uint8_t *>(e0) + off);
-		if (IsBadReadPtr(s, 4))
-			continue;
-		if ((s[0] == 'N' || s[0] == 'n') && s[1] == 'o' && s[2] == 'n' &&
-		    s[3] == 'e')
+		if (v.empty())
 		{
-#ifdef _WIN64
-			out_wf = (off != 16);
-#else
-			out_wf = (off != 8);
-#endif
-			out_str_off = off;
-			return true;
+			log_warn("resolve: '%s' anchor matched 0 functions", what);
+			return nullptr;
+		}
+		if (v.size() > 1)
+			log_warn("resolve: '%s' anchor ambiguous (%zu), using first", what,
+			         v.size());
+		return v.front();
+	}
+
+	void fill_formula_offsets(UE3Layout &L)
+	{
+		L.o_ObjectFlags = PS + 4;
+		ptrdiff_t afterFlags = L.o_ObjectFlags + 8;
+		L.o_Linker = afterFlags + 3 * PS;
+		L.o_LinkerIndex = L.o_Linker + PS;
+		L.o_Outer = L.o_LinkerIndex + 8;
+		L.o_Name = L.o_Outer + PS;
+		ptrdiff_t o_Class = L.o_Name + 8;
+		L.sizeof_UObject = o_Class + 2 * PS;
+		L.l_LinkerRoot = L.sizeof_UObject;
+
+		L.e_SerialSize = 0x20;
+		L.e_SerialOffset = 0x24;
+		L.e_ExportFlags = 0x30 + PS + 4;
+	}
+
+	bool probe_name_layout(uint8_t *names_arr, FNameLayout &nl)
+	{
+		if (!names_arr)
+			return false;
+		auto *data = static_cast<uint8_t *>(ue3raw::rd_ptr(names_arr, 0));
+		if (!data)
+			return false;
+		auto *e0 = static_cast<uint8_t *>(ue3raw::rd_ptr(data, 0));
+		if (!e0)
+			return false;
+		for (size_t off :
+		     {(size_t)(PS + 4), (size_t)12, (size_t)16, (size_t)20, (size_t)24})
+		{
+			if (memcmp(e0 + off, "None", 4) == 0 && e0[off + 4] == 0)
+			{
+				nl.str_off = off;
+				nl.with_flags = (off >= (size_t)(8 + 4 + PS));
+				return true;
+			}
+		}
+		return false;
+	}
+}  // namespace
+
+bool ue3_resolve(UE3Layout &L)
+{
+	ModuleImage img = anchor::image_of(nullptr);
+	if (!img.ok)
+	{
+		log_warn("resolve: bad PE image");
+		return false;
+	}
+	fill_formula_offsets(L);
+
+	L.GetPackageLinker =
+	    only(anchor::functions_referencing_wstr(img, L"PackageResolveFailed"),
+	         "GetPackageLinker");
+	if (L.GetPackageLinker)
+	{
+		void **g = nullptr;
+		if (dxa::gpackagefilecache(
+		        L.GetPackageLinker,
+		        anchor::function_end(img, L.GetPackageLinker), g))
+			L.GPackageFileCache = g;
+		else
+			log_warn("resolve: GPackageFileCache not found");
+	}
+
+	L.StaticFindObjectFast = only(
+	    anchor::functions_referencing_wstr(
+	        img,
+	        L"Illegal call to StaticFindObjectFast() while serializing object "
+	        L"data or garbage collecting!"),
+	    "StaticFindObjectFast");
+
+	{
+		std::vector<void *> hits;
+		for (void *fn :
+		     anchor::functions_referencing_wstr(img, L"ObjectNotFound"))
+			if (L.GetPackageLinker &&
+			    anchor::function_calls(img, fn, L.GetPackageLinker))
+				hits.push_back(fn);
+		L.StaticLoadObject = only(hits, "StaticLoadObject");
+	}
+
+	L.Preload =
+	    only(anchor::functions_referencing_wstr(img, L"SerialSize"), "Preload");
+	if (L.Preload)
+	{
+		uint8_t *end = anchor::function_end(img, L.Preload);
+		int64_t v = 0;
+
+		if (dx::first_neg_lea(L.Preload, end, v, 48))
+			L.l_FArchiveOff = static_cast<ptrdiff_t>(v);
+		else
+			log_warn("resolve: FArchiveOff not found");
+
+		if (dx::first_imul_imm(L.Preload, end, v))
+			L.exp_stride = static_cast<ptrdiff_t>(v);
+		else
+			log_warn("resolve: export stride not found");
+
+		if (L.exp_stride &&
+		    dx::array_base_disp_for_stride(L.Preload, end, L.exp_stride, v))
+		{
+			L.l_ExportMap = L.l_FArchiveOff + static_cast<ptrdiff_t>(v);
+			ptrdiff_t ta = PS + 8;
+			L.l_ImportMap = L.l_ExportMap - ta;
+			L.l_NameMap = L.l_ExportMap - 2 * ta;
+		}
+		else
+			log_warn("resolve: ExportMap offset not derived");
+
+		for (int slot : {10, 13, 16})
+		{
+			ptrdiff_t off = 0;
+			if (dxa::field_off_for_vslot(L.Preload, end, slot, off))
+			{
+				L.l_Loader = L.l_FArchiveOff + off;
+				break;
+			}
+		}
+		if (!L.l_Loader)
+			log_warn("resolve: Loader offset not derived");
+		if (L.l_Loader)
+			L.l_OriginalLoader = L.l_Loader + PS;
+
+		{
+			void **g = nullptr;
+			ptrdiff_t vt = 0;
+			if (dxa::serialized_object_and_serialize(L.Preload, end, g, vt))
+			{
+				L.GSerializedObject = g;
+				L.vt_Serialize = vt;
+			}
+			else
+				log_warn("resolve: GSerializedObject/Serialize not found");
+		}
+
+		if (L.l_FArchiveOff && L.l_Loader &&
+		    !resolve_farchive_slots(L.ar, L.Preload, L.l_FArchiveOff,
+		                            L.l_Loader))
+			log_warn("resolve: FArchive slots not fully derived "
+			         "(validated=%d Serialize=%d Tell=%d) — check this build",
+			         (int)L.ar.validated, L.ar.Serialize, L.ar.Tell);
+	}
+
+	for (void *fn : anchor::functions_referencing_wstr(
+	         img, L"Hardcoded name '%s' at index %i was duplicated. "
+	              L"Existing entry is '%s'."))
+	{
+		uint8_t *fend = anchor::function_end(img, fn);
+		void **arr = nullptr;
+		if (dxa::indexed_store_global(fn, fend, arr, static_cast<int>(PS)))
+		{
+			L.FNameNamesArr = reinterpret_cast<uint8_t *>(arr);
+			L.ArrayRealloc = dx::call_feeding_global_store(fn, fend, arr);
+			break;
 		}
 	}
-	return false;
-}
+	if (L.FNameNamesArr && !L.ArrayRealloc)
+		log_warn("resolve: ArrayRealloc not found (runtime append disabled)");
 
-static void *scan_rip_mov(const uint8_t *start, size_t len)
-{
-	for (size_t i = 0; i + 7 <= len; ++i)
+	if (!L.FNameInit)
 	{
-		if ((start[i] & 0xF8) != 0x48)
-			continue;
-		if (start[i + 1] != 0x8B)
-			continue;
-		if ((start[i + 2] & 0xC7) != 0x05)
-			continue;
-		int32_t disp;
-		memcpy(&disp, start + i + 3, 4);
-		return const_cast<uint8_t *>(start) + i + 7 + disp;
-	}
-	return nullptr;
-}
-
-static FNameNamesArray *scan_body_for_fnames(const uint8_t *body, size_t len,
-                                             bool &out_wf, size_t &out_str_off)
-{
-	for (size_t i = 0; i + 7 <= len; ++i)
-	{
-		if ((body[i] & 0xF8) != 0x48)
-			continue;
-		if (body[i + 1] != 0x8B)
-			continue;
-		if ((body[i + 2] & 0xC7) != 0x05)
-			continue;
-		int32_t disp;
-		memcpy(&disp, body + i + 3, 4);
-		void *cand = const_cast<uint8_t *>(body) + i + 7 + disp;
-		if (validate_fnames(cand, out_wf, out_str_off))
-			return static_cast<FNameNamesArray *>(cand);
-	}
-	return nullptr;
-}
-
-static FNameNamesArray *find_fname_names(void *fname_init, bool &out_wf,
-                                         size_t &out_str_off)
-{
-	const auto *fn = static_cast<const uint8_t *>(fname_init);
-
-	for (size_t i = 0; i + 5 <= 0x80; ++i)
-	{
-		if (fn[i] != 0xE8)
-			continue;
-		int32_t rel;
-		memcpy(&rel, fn + i + 1, 4);
-		const uint8_t *sub = fn + i + 5 + rel;
-		if (auto *f = scan_body_for_fnames(sub, 0x800, out_wf, out_str_off))
+		uint8_t *cur = img.text, *tend = img.text + img.text_size;
+		while (void *site = dx::find_split_name_setup(cur, tend))
 		{
-			log_info("ue3_resolve: FNameNames via FNameInit sub-call %p  "
-			         "(str_off=%zu  with_flags=%d)",
-			         sub, out_str_off, (int)out_wf);
-			return f;
+			void *fn = anchor::function_entry(img, site);
+			uint8_t *fend = fn ? anchor::function_end(img, fn) : nullptr;
+
+			if (fn && fend && dx::has_fname_none_store(fn, fend))
+			{
+				L.FNameInit = fn;
+				break;
+			}
+
+			uint8_t *next = static_cast<uint8_t *>(site) + 1;
+			if (fend && fend > next)
+				next = fend;
+			cur = next;
 		}
-		break;
 	}
 
-	if (auto *f = scan_body_for_fnames(fn, 0x600, out_wf, out_str_off))
-	{
-		log_info("ue3_resolve: FNameNames via FNameInit body  "
-		         "(str_off=%zu  with_flags=%d)",
-		         out_str_off, (int)out_wf);
-		return f;
-	}
+	if (!L.FNameNamesArr)
+		log_warn("resolve: FName::Names not identified");
+	else if (!L.FNameInit)
+		log_warn("resolve: FName::Init not identified (name-remap disabled)");
 
-	return nullptr;
-}
+	if (L.FNameNamesArr && !probe_name_layout(L.FNameNamesArr, L.name))
+		log_warn("resolve: FName entry layout probe failed");
 
-static UE3Addrs g_ue3;
+	const bool override_ok = L.Preload && L.l_FArchiveOff && L.exp_stride &&
+	                         L.l_ExportMap && L.l_Loader && L.vt_Serialize &&
+	                         L.GSerializedObject && L.FNameNamesArr &&
+	                         L.name.str_off;
+	const bool find_ok = L.StaticFindObjectFast && L.FNameInit;
+	L.ok = override_ok;
 
-UE3Addrs &ue3() { return g_ue3; }
-
-bool ue3_resolve(UE3Addrs &out)
-{
-	HMODULE mod = GetModuleHandleW(nullptr);
-
-	auto scan = [&](const char *pat, const char *name) -> void *
-	{
-		void *p = FindPatternString(mod, pat);
-		if (p)
-			log_info("ue3_resolve: %-28s = %p", name, p);
-		else
-			log_err("ue3_resolve: %-28s NOT FOUND", name);
-		return p;
-	};
-
-	out.FNameInit = scan(kPat_FNameInit, "FNameInit");
-	out.StaticFindObjectFast =
-	    scan(kPat_StaticFindObjectFast, "StaticFindObjectFast");
-	out.StaticLoadObject = scan(kPat_StaticLoadObject, "StaticLoadObject");
-	out.StaticConstructObject =
-	    scan(kPat_StaticConstructObject, "StaticConstructObject");
-	out.CreatePackage = scan(kPat_CreatePackage, "CreatePackage");
-
-	auto *gpl =
-	    static_cast<uint8_t *>(FindPatternString(mod, kPat_GetPackageLinker));
-	if (gpl)
-	{
-		out.GPackageFileCache = static_cast<void **>(scan_rip_mov(gpl, 0x300));
-		if (out.GPackageFileCache)
-			log_info("ue3_resolve: %-28s = %p", "GPackageFileCache",
-			         out.GPackageFileCache);
-		else
-			log_warn(
-			    "ue3_resolve: GPackageFileCache RIP-MOV not found in body");
-	}
-	else
-	{
-		log_warn("ue3_resolve: GetPackageLinker not found — "
-		         "GPackageFileCache unavailable");
-	}
-
-	bool wf = true;
-	size_t str_off = kStrOffCandidates[1];
-	if (out.FNameInit)
-	{
-		out.FNameNames = find_fname_names(out.FNameInit, wf, str_off);
-	}
-	else
-	{
-		log_warn("ue3_resolve: FNameInit missing, skipping FNameNames scan");
-	}
-	out.name_layout.with_flags = wf;
-	out.name_layout.str_off = str_off;
-
-	if (out.FNameNames)
-		log_info("ue3_resolve: %-28s = %p  (Num=%d  str_off=%zu  layout=%s)",
-		         "FNameNames", out.FNameNames, out.FNameNames->Num, str_off,
-		         wf ? "with_flags" : "no_flags");
-	else
-		log_warn("ue3_resolve: FNameNames not found — name logging silent");
-
-	if (!out.StaticFindObjectFast || !out.StaticLoadObject)
-	{
-		log_err("ue3_resolve: critical functions not found, aborting");
-		return false;
-	}
-	if (!out.StaticConstructObject)
-		log_warn("ue3_resolve: StaticConstructObject missing — spawn disabled");
-	if (!out.CreatePackage)
-		log_warn("ue3_resolve: CreatePackage missing — spawn disabled");
-
-	return true;
+	log_info("resolve[%d-bit]: GPL=%p SFOF=%p SLO=%p Init=%p Preload=%p",
+	         (int)(PS * 8), L.GetPackageLinker, L.StaticFindObjectFast,
+	         L.StaticLoadObject, L.FNameInit, L.Preload);
+	log_info("resolve: FArchiveOff=0x%zX stride=0x%zX Name/Imp/Exp=0x%zX/0x%zX/"
+	         "0x%zX Loader=0x%zX Root=0x%zX",
+	         (size_t)L.l_FArchiveOff, (size_t)L.exp_stride, (size_t)L.l_NameMap,
+	         (size_t)L.l_ImportMap, (size_t)L.l_ExportMap, (size_t)L.l_Loader,
+	         (size_t)L.l_LinkerRoot);
+	log_info(
+	    "resolve: uobj Flags/Linker/LinkerIdx/Outer/Name=0x%zX/0x%zX/0x%zX/"
+	    "0x%zX/0x%zX vtSerialize=0x%zX str_off=%zu wf=%d",
+	    (size_t)L.o_ObjectFlags, (size_t)L.o_Linker, (size_t)L.o_LinkerIndex,
+	    (size_t)L.o_Outer, (size_t)L.o_Name, (size_t)L.vt_Serialize,
+	    L.name.str_off, (int)L.name.with_flags);
+	log_info("resolve: override_ok=%d find_ok=%d", (int)override_ok,
+	         (int)find_ok);
+	return L.ok;
 }

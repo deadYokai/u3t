@@ -14,6 +14,7 @@ namespace override_loader
 		std::vector<std::string> tool_names;
 		std::vector<int32_t> name_remap;
 		bool name_remap_ready = false;
+		std::vector<int32_t> name_map_final;
 	};
 
 	void discover(const std::vector<LoadedMod> &mods);

@@ -1,32 +1,60 @@
 #include <memory>
-#include <unordered_set>
 #define WIN32_LEAN_AND_MEAN
 #include "hook.hpp"
-#include "linker_layout.hpp"
 #include "logs.hpp"
 #include "override_loader.hpp"
-#include "pattern_scanner.hpp"
-#include "ue3_types.hpp"
+#include "ue3_layout.hpp"
+#include "ue3_patch.hpp"
 #include "util.hpp"
-#include "utypes/ULinker.hpp"
-#include "utypes/ULinkerLoad_Preload.hpp"
 #include <cstring>
 #include <psapi.h>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
+
 #include <windows.h>
 
-static constexpr int kVT_Serialize = FArchiveVtSlot::Serialize;
-static constexpr int kVT_Tell = FArchiveVtSlot::Tell;
-static constexpr int kVT_TotalSize = FArchiveVtSlot::TotalSize;
-static constexpr int kVT_Seek = FArchiveVtSlot::Seek;
-static constexpr int kVT_Precache = FArchiveVtSlot::Precache;
-static constexpr int kVT_IsError = FArchiveVtSlot::GetError;
-static constexpr int kVT_SLOTS = FArchiveVtSlot::Count;
+static constexpr int kVT_MAX = 64;
 
-static void copy_live_version(FArchiveData *dst, void *linker)
+struct FNameStack
 {
-	const auto *src = reinterpret_cast<const FArchiveData *>(
+	int32_t Index;
+	int32_t Number;
+};
+
+static inline int uobj_serialize_slot()
+{
+	return ue3().vt_Serialize
+	           ? static_cast<int>(ue3().vt_Serialize / sizeof(void *))
+	           : -1;
+}
+
+static inline int32_t fname_count()
+{
+	return ue3().FNameNamesArr ? static_cast<int32_t>(ue3raw::rd_u32(
+	                                 ue3().FNameNamesArr, sizeof(void *)))
+	                           : 0;
+}
+
+static void namemap_get(void *l, void *&d, int32_t &n, int32_t &m)
+{
+	uint8_t *p = static_cast<uint8_t *>(l) + ue3().l_NameMap;
+	d = ue3raw::rd_ptr(p, 0);
+	n = static_cast<int32_t>(ue3raw::rd_u32(p, sizeof(void *)));
+	m = static_cast<int32_t>(ue3raw::rd_u32(p, sizeof(void *) + 4));
+}
+
+static void namemap_set(void *l, void *d, int32_t n, int32_t m)
+{
+	uint8_t *p = static_cast<uint8_t *>(l) + ue3().l_NameMap;
+	memcpy(p, &d, sizeof(void *));
+	memcpy(p + sizeof(void *), &n, 4);
+	memcpy(p + sizeof(void *) + 4, &m, 4);
+}
+
+static void copy_live_version(FArchiveFields *dst, void *linker)
+{
+	const auto *src = reinterpret_cast<const FArchiveFields *>(
 	    static_cast<const uint8_t *>(linker_farchive(linker)) + sizeof(void *));
 	dst->ArVer = src->ArVer;
 	dst->ArNetVer = src->ArNetVer;
@@ -37,7 +65,7 @@ static void copy_live_version(FArchiveData *dst, void *linker)
 struct BufReader
 {
 	void *vt;
-	FArchiveData ar;
+	FArchiveFields ar;
 	const uint8_t *data;
 	size_t size;
 	size_t pos;
@@ -45,12 +73,7 @@ struct BufReader
 	bool anchored;
 };
 
-static_assert(offsetof(BufReader, vt) == 0);
-static_assert(offsetof(BufReader, ar) == 8);
-static_assert(offsetof(BufReader, data) == 136);
-static_assert(offsetof(BufReader, ar.ArVer) == 8);
-
-static void *g_buf_vt[kVT_SLOTS];
+static void *g_buf_vt[kVT_MAX];
 static bool g_buf_vt_ready = false;
 
 static void __cdecl br_Serialize(BufReader *self, void *dst, int32_t len)
@@ -78,7 +101,6 @@ static void __cdecl br_Seek(BufReader *self, int32_t pos)
 {
 	if (!self->anchored)
 	{
-
 		self->serial_off = pos;
 		self->anchored = true;
 		self->pos = 0;
@@ -102,13 +124,21 @@ static int32_t __cdecl br_IsError(BufReader *) { return 0; }
 
 static void build_buf_vt(void **real_vt)
 {
-	memcpy(g_buf_vt, real_vt, kVT_SLOTS * sizeof(void *));
-	g_buf_vt[kVT_Serialize] = reinterpret_cast<void *>(&br_Serialize);
-	g_buf_vt[kVT_Tell] = reinterpret_cast<void *>(&br_Tell);
-	g_buf_vt[kVT_TotalSize] = reinterpret_cast<void *>(&br_TotalSize);
-	g_buf_vt[kVT_Seek] = reinterpret_cast<void *>(&br_Seek);
-	g_buf_vt[kVT_Precache] = reinterpret_cast<void *>(&br_Precache);
-	g_buf_vt[kVT_IsError] = reinterpret_cast<void *>(&br_IsError);
+	const FArchiveSlots &S = ue3().ar;
+	const int n = S.total > 0 && S.total <= kVT_MAX ? S.total : kVT_MAX;
+	memcpy(g_buf_vt, real_vt, n * sizeof(void *));
+	if (S.Serialize >= 0)
+		g_buf_vt[S.Serialize] = reinterpret_cast<void *>(&br_Serialize);
+	if (S.Tell >= 0)
+		g_buf_vt[S.Tell] = reinterpret_cast<void *>(&br_Tell);
+	if (S.TotalSize >= 0)
+		g_buf_vt[S.TotalSize] = reinterpret_cast<void *>(&br_TotalSize);
+	if (S.Seek >= 0)
+		g_buf_vt[S.Seek] = reinterpret_cast<void *>(&br_Seek);
+	if (S.Precache >= 0)
+		g_buf_vt[S.Precache] = reinterpret_cast<void *>(&br_Precache);
+	if (S.GetError >= 0)
+		g_buf_vt[S.GetError] = reinterpret_cast<void *>(&br_IsError);
 	g_buf_vt_ready = true;
 	log_info("override: BufReader vtable built from real_vt=%p",
 	         (void *)real_vt);
@@ -128,9 +158,8 @@ static thread_local FNamePatchCtx tl_fn{};
 
 static void *__cdecl fname_remap_thunk(void *fa, void *fname_out)
 {
-	const auto &ll = linker_layout();
 	{
-		void *lb = static_cast<uint8_t *>(fa) - ll.farchive_off;
+		void *lb = static_cast<uint8_t *>(fa) - ue3().l_FArchiveOff;
 		void *cur = *linker_loader_ptr(lb);
 		if (cur != tl_fn.active_br)
 		{
@@ -152,26 +181,21 @@ static void *__cdecl fname_remap_thunk(void *fa, void *fname_out)
 		         br ? br->size : 0);
 	}
 
-	int32_t live = raw[0];
+	int32_t name_index = 0;  // NAME_None fallback
 	if (raw[0] >= 0 && tl_fn.remap &&
 	    static_cast<size_t>(raw[0]) < tl_fn.remap_size)
 	{
-		int32_t m = tl_fn.remap[raw[0]];
-		if (m >= 0)
-			live = m;
-		else
-			log_warn("override: fname_remap: tool_idx=%d unmapped", raw[0]);
+		name_index = tl_fn.remap[raw[0]];
+	}
+	else
+	{
+		log_warn("override: fname_remap: tool_idx=%d out of range "
+		         "(remap_size=%zu) -> None",
+		         raw[0], tl_fn.remap_size);
 	}
 
-	void *lb2 = static_cast<uint8_t *>(fa) - ll.farchive_off;
-	const TArray<FName> *nm = linker_namemap(lb2);
-
-	int32_t raw_name_idx = live;
-	if (nm->Data && live >= 0 && live < nm->Num)
-		raw_name_idx = nm->Data[live].Index;
-
 	int32_t *out = static_cast<int32_t *>(fname_out);
-	out[0] = raw_name_idx;
+	out[0] = name_index;
 	out[1] = raw[1];
 	return fa;
 }
@@ -179,17 +203,19 @@ static void *__cdecl fname_remap_thunk(void *fa, void *fname_out)
 static void install_fname_patch(void *linker,
                                 const override_loader::OverrideRecord &rec)
 {
-	const auto &ll = linker_layout();
-	uint8_t *fa = static_cast<uint8_t *>(linker) + ll.farchive_off;
+	uint8_t *fa = static_cast<uint8_t *>(linker) + ue3().l_FArchiveOff;
 	void **orig = *reinterpret_cast<void ***>(fa);
 
-	void **pv = new void *[kVT_SLOTS];
-	memcpy(pv, orig, kVT_SLOTS * sizeof(void *));
-	pv[ll.fname_slot] = reinterpret_cast<void *>(&fname_remap_thunk);
+	const int fslot = ue3().ar.SerializeName;
+	const int n = ue3().ar.total > 0 ? ue3().ar.total : kVT_MAX;
+	void **pv = new void *[n];
+	memcpy(pv, orig, n * sizeof(void *));
+	if (fslot >= 0)
+		pv[fslot] = reinterpret_cast<void *>(&fname_remap_thunk);
 
 	tl_fn = {rec.name_remap.data(),
 	         rec.name_remap.size(),
-	         orig[ll.fname_slot],
+	         fslot >= 0 ? orig[fslot] : nullptr,
 	         orig,
 	         pv,
 	         nullptr};
@@ -201,8 +227,7 @@ static void install_fname_patch(void *linker,
 
 static void remove_fname_patch(void *linker)
 {
-	const auto &ll = linker_layout();
-	uint8_t *fa = static_cast<uint8_t *>(linker) + ll.farchive_off;
+	uint8_t *fa = static_cast<uint8_t *>(linker) + ue3().l_FArchiveOff;
 	if (!tl_fn.patched_vt)
 		return;
 	*reinterpret_cast<void ***>(fa) = tl_fn.orig_vt;
@@ -218,18 +243,15 @@ static bool safe_read(const void *p, size_t n)
 
 static std::wstring fname_str(int32_t gidx)
 {
-	const auto *names = ue3().FNameNames;
-	if (!names || gidx < 0 || gidx >= names->Num)
+	void *entry = fname_entry(gidx);
+	if (!entry || !safe_read(entry, ue3().name.str_off + 4))
 		return {};
-	void *entry = names->Data[gidx];
-	if (!entry || !safe_read(entry, ue3().name_layout.str_off + 4))
-		return {};
-	if (ue3().name_layout.is_unicode(entry))
+	if (ue3().name.is_unicode(entry))
 	{
-		const wchar_t *s = ue3().name_layout.uni(entry);
+		const wchar_t *s = ue3().name.uni(entry);
 		return safe_read(s, 2) ? std::wstring(s) : std::wstring{};
 	}
-	const char *s = ue3().name_layout.ansi(entry);
+	const char *s = ue3().name.ansi(entry);
 	return safe_read(s, 1) ? to_wide(std::string(s)) : std::wstring{};
 }
 
@@ -238,30 +260,29 @@ static void debug_dump_chain(const void *obj)
 	const void *cur = obj;
 	for (int d = 0; d < 8 && cur; ++d)
 	{
-		if (!safe_read(cur, sizeof(UObject_Mirror)))
+		if (!safe_read(cur, ue3().sizeof_UObject))
 		{
 			log_info("  [%d] ptr=%p UNREADABLE", d, cur);
 			break;
 		}
-		const FName nm = uobj_name(cur);
+		const int32_t idx = uobj_name_index(cur);
+		const int32_t num = uobj_name_number(cur);
 		const void *outer = uobj_outer(cur);
-		std::wstring s = (nm.Index >= 0 && nm.Index < ue3().FNameNames->Num)
-		                     ? fname_str(nm.Index)
-		                     : L"<oob>";
+		std::wstring s = fname_str(idx);
 		log_info(
 		    "  [%d] ptr=%p outer=%p name.Index=%d name.Number=%d str='%ls'", d,
-		    cur, outer, nm.Index, nm.Number, s.c_str());
+		    cur, outer, idx, num, s.empty() ? L"<oob>" : s.c_str());
 		cur = outer;
 	}
 }
 
 static std::wstring get_uobj_path(const void *obj, void *linker)
 {
-	if (!obj || !ue3().FNameNames || !safe_read(obj, sizeof(UObject_Mirror)))
+	if (!obj || !ue3().FNameNamesArr || !safe_read(obj, ue3().sizeof_UObject))
 		return {};
 
 	const void *root =
-	    (linker && safe_read(linker_root(linker), sizeof(UObject_Mirror)))
+	    (linker && safe_read(linker_root(linker), ue3().sizeof_UObject))
 	        ? linker_root(linker)
 	        : nullptr;
 
@@ -269,16 +290,15 @@ static std::wstring get_uobj_path(const void *obj, void *linker)
 	const void *cur = obj;
 	for (int d = 0; d < 8 && cur && cur != root; ++d)
 	{
-		if (!safe_read(cur, sizeof(UObject_Mirror)))
+		if (!safe_read(cur, ue3().sizeof_UObject))
 			break;
-		const FName nm = uobj_name(cur);
-		if (nm.Index < 0 || nm.Index >= ue3().FNameNames->Num)
-			break;
-		std::wstring seg = fname_str(nm.Index);
+		const int32_t idx = uobj_name_index(cur);
+		const int32_t num = uobj_name_number(cur);
+		std::wstring seg = fname_str(idx);
 		if (seg.empty())
 			break;
-		if (nm.Number != 0)
-			seg += L"_" + std::to_wstring(nm.Number - 1);
+		if (num != 0)
+			seg += L"_" + std::to_wstring(num - 1);
 		parts.push_back(seg);
 		cur = uobj_outer(cur);
 	}
@@ -288,13 +308,11 @@ static std::wstring get_uobj_path(const void *obj, void *linker)
 	std::wstring path;
 	if (root)
 	{
-		const FName pn = uobj_name(root);
-		if (pn.Index >= 0 && pn.Index < ue3().FNameNames->Num)
-		{
-			path = fname_str(pn.Index);
-			if (pn.Number != 0)
-				path += L"_" + std::to_wstring(pn.Number - 1);
-		}
+		const int32_t pidx = uobj_name_index(root);
+		const int32_t pnum = uobj_name_number(root);
+		path = fname_str(pidx);
+		if (!path.empty() && pnum != 0)
+			path += L"_" + std::to_wstring(pnum - 1);
 	}
 	for (auto it = parts.rbegin(); it != parts.rend(); ++it)
 	{
@@ -311,82 +329,110 @@ static void build_name_remap(override_loader::OverrideRecord &rec, void *linker)
 	if (rec.tool_names.empty())
 		return;
 
-	const TArray<FName> *nm = linker_namemap(linker);
+	TArrayView nm = linker_namemap(linker);
 	log_info("override: build_name_remap '%ls' nm=%p Num=%d", rec.key.c_str(),
-	         (void *)nm->Data, nm->Num);
+	         (void *)nm.data, nm.num);
 
-	if (!nm->Data || nm->Num <= 0 || nm->Num > 1000000 ||
-	    IsBadReadPtr(nm->Data, static_cast<size_t>(nm->Num) * sizeof(FName)))
+	using FNameInitFn = void(__cdecl *)(void *, const wchar_t *, int32_t);
+	auto fni = reinterpret_cast<FNameInitFn>(ue3().FNameInit);
+	if (!fni)
 	{
-		log_warn("override: build_name_remap '%ls' — NameMap invalid",
+		log_warn("override: build_name_remap '%ls' — FNameInit unresolved",
 		         rec.key.c_str());
+		rec.name_remap.clear();
 		return;
 	}
 
-	rec.name_remap.assign(rec.tool_names.size(), -1);
-	for (int32_t li = 0; li < nm->Num; ++li)
+	rec.name_remap.assign(rec.tool_names.size(), 0);
+	for (size_t ti = 0; ti < rec.tool_names.size(); ++ti)
 	{
-		const int32_t gidx = fname_entry_index(nm->Data[li]);
-		if (gidx < 0 || gidx >= ue3().FNameNames->Num)
-			continue;
-		const std::wstring ws = fname_str(gidx);
-		if (ws.empty())
-			continue;
-		const std::string n(ws.begin(), ws.end());
-		for (size_t ti = 0; ti < rec.tool_names.size(); ++ti)
-			if (rec.tool_names[ti] == n && rec.name_remap[ti] < 0)
-				rec.name_remap[ti] = li;
+		const std::wstring w = to_wide(rec.tool_names[ti]);
+		FNameStack tmp{};
+		fni(&tmp, w.c_str(), 1);
+		rec.name_remap[ti] = tmp.Index;
 	}
 
-	size_t mapped = 0;
-	for (int32_t v : rec.name_remap)
-		if (v >= 0)
-			++mapped;
-	log_info("override: name_remap '%ls' %zu/%zu resolved", rec.key.c_str(),
-	         mapped, rec.tool_names.size());
+	if (!rec.name_remap.empty())
+	{
+		auto *name_map = reinterpret_cast<UE3TArray *>(
+		    static_cast<uint8_t *>(linker) + ue3().l_NameMap);
+		UE3FName *existing = reinterpret_cast<UE3FName *>(name_map->Data);
+		int existing_num = name_map->Num;
+
+		std::vector<UE3FName> to_add;
+		rec.name_map_final.resize(rec.name_remap.size());
+
+		for (size_t i = 0; i < rec.name_remap.size(); ++i)
+		{
+			UE3FName fname{rec.name_remap[i], 0};
+			bool found = false;
+			for (int j = 0; j < existing_num; ++j)
+			{
+				if (memcmp(&existing[j], &fname, sizeof(UE3FName)) == 0)
+				{
+					rec.name_map_final[i] = j;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				rec.name_map_final[i] =
+				    existing_num + static_cast<int>(to_add.size());
+				to_add.push_back(fname);
+			}
+		}
+
+		if (!to_add.empty())
+		{
+			int base = ue3_append_names(linker, to_add.data(),
+			                            static_cast<int>(to_add.size()));
+			(void)base;
+		}
+		log_info("override: processed %zu names, %zu new appended",
+		         rec.name_remap.size(), to_add.size());
+	}
+
+	log_info("override: name_remap '%ls' %zu/%zu interned", rec.key.c_str(),
+	         rec.tool_names.size(), rec.tool_names.size());
 }
 
-using PreloadFn = void(__cdecl *)(ULinkerLoad_Mirror *, UObject_Mirror *);
+using PreloadFn = void(__cdecl *)(void *, void *);
 static PreloadFn g_orig_Preload = nullptr;
 
 static void call_object_serialize(void *obj, void *linker)
 {
-	const auto &ll = linker_layout();
-	void *farchive = static_cast<uint8_t *>(linker) + ll.farchive_off;
-
-	if (ll.uobj_serialize_vtslot < 0)
+	void *farchive = static_cast<uint8_t *>(linker) + ue3().l_FArchiveOff;
+	const int slot = uobj_serialize_slot();
+	if (slot < 0)
 	{
-
 		log_warn("override: Serialize slot unknown — should not reach here");
 		return;
 	}
 
 	void *prev_serial = nullptr;
-	if (ll.g_serialized_obj)
+	if (ue3().GSerializedObject)
 	{
-		prev_serial = *ll.g_serialized_obj;
-		*ll.g_serialized_obj = obj;
+		prev_serial = *ue3().GSerializedObject;
+		*ue3().GSerializedObject = obj;
 	}
 
 	using SerializeFn = void(__cdecl *)(void *, void *);
 	void **vt = *static_cast<void ***>(obj);
-	auto serialize =
-	    reinterpret_cast<SerializeFn>(vt[ll.uobj_serialize_vtslot]);
+	auto serialize = reinterpret_cast<SerializeFn>(vt[slot]);
 	serialize(obj, farchive);
 
-	if (ll.g_serialized_obj)
-		*ll.g_serialized_obj = prev_serial;
+	if (ue3().GSerializedObject)
+		*ue3().GSerializedObject = prev_serial;
 }
 
-static void do_override_preload(ULinkerLoad_Mirror *linker, UObject_Mirror *obj,
-                                const FObjectExport_Mirror &exp,
+static void do_override_preload(void *linker, void *obj, void *exp,
                                 override_loader::OverrideRecord &rec)
 {
-	const auto &ll = linker_layout();
 	const bool has_remap = !rec.name_remap.empty();
-	const bool vtslot_known = ll.uobj_serialize_vtslot >= 0;
+	const bool vtslot_known = uobj_serialize_slot() >= 0;
 
-	if (uobj_has_flag(obj, kRF_ClassDefaultObject) || !vtslot_known)
+	if (uobj_has_flag(obj, RF_ClassDefaultObject) || !vtslot_known)
 	{
 		g_orig_Preload(linker, obj);
 		return;
@@ -424,14 +470,31 @@ static void do_override_preload(ULinkerLoad_Mirror *linker, UObject_Mirror *obj,
 		tl_fn.active_br = br_ptr;
 	}
 
-	br_Seek(&br, exp.SerialOffset);
+	void *saved_nm_data = nullptr;
+	int32_t saved_nm_num = 0, saved_nm_max = 0;
+	namemap_get(linker, saved_nm_data, saved_nm_num, saved_nm_max);
+	std::vector<FNameStack> shadow_nm;
+	if (has_remap)
+	{
+		shadow_nm.resize(rec.name_remap.size());
+		for (size_t i = 0; i < rec.name_remap.size(); ++i)
+			shadow_nm[i] = FNameStack{rec.name_remap[i], 0};
+		namemap_set(linker, shadow_nm.data(),
+		            static_cast<int32_t>(shadow_nm.size()),
+		            static_cast<int32_t>(shadow_nm.size()));
+	}
 
-	uobj_clear_flag(obj, kRF_NeedLoad);
+	br_Seek(&br, exp_serial_offset(exp));
+
+	uobj_clear_flag(obj, RF_NeedLoad);
 
 	call_object_serialize(obj, linker);
 
 	if (has_remap)
+	{
+		namemap_set(linker, saved_nm_data, saved_nm_num, saved_nm_max);
 		remove_fname_patch(linker);
+	}
 
 	*linker_loader_ptr(linker) = real_loader;
 	*linker_original_loader_ptr(linker) = real_original;
@@ -440,56 +503,43 @@ static void do_override_preload(ULinkerLoad_Mirror *linker, UObject_Mirror *obj,
 	         rec.key.c_str(), br.pos, br.size);
 }
 
-static const char *kPat_Preload =
-    "48 8b c4 55 56 57 41 54 41 55 41 56 41 57 48 81 ec a0 00 00 00 48 c7 44 "
-    "24 60 fe ff ff ff";
-
-static inline void orig_preload(ULinkerLoad_Mirror *linker, UObject_Mirror *obj)
+static inline void orig_preload(void *linker, void *obj)
 {
 	if (linker && g_orig_Preload)
-		g_orig_Preload(
-		    reinterpret_cast<ULinkerLoad_Mirror *>(linker_farchive(linker)),
-		    obj);
+		g_orig_Preload(linker_farchive(linker), obj);
 }
 
-static void __cdecl hooked_Preload(ULinkerLoad_Mirror *farchive,
-                                   UObject_Mirror *obj)
+static void __cdecl hooked_Preload(void *farchive, void *obj)
 {
-	ULinkerLoad_Mirror *linker =
-	    farchive
-	        ? reinterpret_cast<ULinkerLoad_Mirror *>(
-	              reinterpret_cast<uint8_t *>(farchive) - kLinker_FArchiveOff)
-	        : nullptr;
+	void *linker = farchive
+	                   ? static_cast<uint8_t *>(farchive) - ue3().l_FArchiveOff
+	                   : nullptr;
 
-	if (!linker_layout().valid || !linker || !obj || !ue3().FNameNames)
+	if (!ue3().ok || !linker || !obj || !ue3().FNameNamesArr)
 	{
 		orig_preload(linker, obj);
 		return;
 	}
 
-	if (!safe_read(obj, sizeof(UObject_Mirror)))
+	if (!safe_read(obj, ue3().sizeof_UObject))
 	{
 		orig_preload(linker, obj);
 		return;
 	}
 
-	if (!uobj_has_flag(obj, kRF_NeedLoad))
+	if (!uobj_has_flag(obj, RF_NeedLoad))
 	{
 		orig_preload(linker, obj);
 		return;
 	}
 
-	// log_info("obj=%p _Linker=%p linker=%p outer=%p class=%p", obj,
-	// obj->_Linker,
-	//          linker, obj->Outer, obj->Class);
-	if (obj->_Linker != linker)
+	if (uobj_linker(obj) != linker)
 	{
 		orig_preload(linker, obj);
 		return;
 	}
 
 	std::wstring path = get_uobj_path(obj, linker);
-
 	if (path.empty())
 	{
 		orig_preload(linker, obj);
@@ -497,12 +547,8 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *farchive,
 	}
 
 	auto *rec = override_loader::find(path);
-
 	if (!rec || rec->bin.empty())
 	{
-		// static std::unordered_set<std::wstring> s_missed;
-		// if (s_missed.insert(path).second)
-		// 	log_info("override: NO MATCH for path='%ls'", path.c_str());
 		orig_preload(linker, obj);
 		return;
 	}
@@ -510,16 +556,15 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *farchive,
 	log_info("override: Preload '%ls' (%zu bytes)", path.c_str(),
 	         rec->bin.size());
 
-	if (!uobj_has_flag(obj, kRF_NeedLoad))
+	if (!uobj_has_flag(obj, RF_NeedLoad))
 	{
 		log_info("override: '%ls' RF_NeedLoad already clear after re-check",
 		         path.c_str());
 		return;
 	}
 
-	const int32_t idx = obj->_LinkerIndex;
-	const FObjectExport_Mirror *exp = linker_get_export(linker, idx);
-
+	const int32_t idx = uobj_linker_index(obj);
+	void *exp = lk_export(linker, idx);
 	if (!exp)
 	{
 		log_warn("override: '%ls' — bad _LinkerIndex %d, passing through",
@@ -528,13 +573,7 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *farchive,
 		return;
 	}
 
-	if (exp->_Object && exp->_Object != obj)
-	{
-		log_warn("override: '%ls' Export._Object mismatch (%p vs %p)",
-		         path.c_str(), exp->_Object, obj);
-	}
-
-	if (exp->ExportFlags & kEF_ScriptPatcherExport)
+	if (exp_export_flags(exp) & EF_ScriptPatcherExport)
 	{
 		log_warn("override: '%ls' has EF_ScriptPatcherExport — passing through",
 		         path.c_str());
@@ -542,7 +581,7 @@ static void __cdecl hooked_Preload(ULinkerLoad_Mirror *farchive,
 		return;
 	}
 
-	do_override_preload(linker, obj, *exp, *rec);
+	do_override_preload(linker, obj, exp, *rec);
 }
 
 static std::unordered_map<std::wstring, override_loader::OverrideRecord>
@@ -592,23 +631,6 @@ static std::wstring file_stem(const wchar_t *fname)
 	std::wstring s(fname);
 	auto dot = s.rfind(L'.');
 	return dot == std::wstring::npos ? std::wstring{} : s.substr(0, dot);
-}
-
-static std::wstring find_namemap_for_key(const std::wstring &key,
-                                         const std::wstring &ov_dir)
-{
-	std::wstring k = key;
-	while (true)
-	{
-		std::wstring p = ov_dir + L"\\" + k + L".namemap";
-		if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
-			return p;
-		auto dot = k.rfind(L'.');
-		if (dot == std::wstring::npos)
-			break;
-		k = k.substr(0, dot);
-	}
-	return {};
 }
 
 static void scan_package_dir(const std::wstring &pkg_dir,
@@ -714,24 +736,23 @@ namespace override_loader
 			return;
 		}
 
-		void *addr = FindPatternString(GetModuleHandleW(nullptr), kPat_Preload);
-		if (!addr)
+		if (!ue3().ok || !ue3().Preload)
 		{
-			log_err("override_loader: Preload pattern NOT FOUND — overrides "
-			        "disabled");
+			log_err("override_loader: layout unresolved (Preload=%p ok=%d) — "
+			        "overrides disabled",
+			        ue3().Preload, (int)ue3().ok);
 			return;
 		}
 
-		LinkerLayout ll;
-		resolve_linker_layout(ll, nullptr, addr);
-
+		void *addr = ue3().Preload;
 		hook::add(addr, reinterpret_cast<void *>(&hooked_Preload),
 		          reinterpret_cast<void **>(&g_orig_Preload));
 
 		log_info("override_loader: Preload hook at %p  Serialize_slot=%d  "
 		         "GSerialObj=%p  (%zu override(s))",
-		         addr, ll.uobj_serialize_vtslot,
-		         static_cast<void *>(ll.g_serialized_obj), g_overrides.size());
+		         addr, uobj_serialize_slot(),
+		         static_cast<void *>(ue3().GSerializedObject),
+		         g_overrides.size());
 	}
 
 	OverrideRecord *find(const std::wstring &key)
