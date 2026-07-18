@@ -19,7 +19,7 @@ namespace logs
 		AcquireSRWLockExclusive(&g_lock);
 		if (!g_initialized)
 		{
-			std::wstring path = exe_dir + L"\\dinput8.log";
+			std::wstring path = exe_dir + L"\\cu3ml.log";
 			HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
 			                       nullptr, CREATE_ALWAYS,
 			                       FILE_ATTRIBUTE_NORMAL, nullptr);

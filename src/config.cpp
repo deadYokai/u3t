@@ -185,11 +185,7 @@ bool parse_mod_config(const std::string &path, ModConfig &out)
 		}
 		else
 		{
-			if (k == "upk_version")
-				out.upk_version = parse_u32(v);
-			else if (k == "license_version")
-				out.license_version = parse_u32(v);
-			else if (k == "name")
+			if (k == "name")
 				out.name = parse_str(v);
 			else if (k == "author")
 				out.author = parse_str(v);
@@ -205,8 +201,5 @@ bool parse_mod_config(const std::string &path, ModConfig &out)
 	}
 	flush_sp();
 
-	if (out.upk_version == 0)
-		log_warn("config: upk_version not set in %s — defaulting to 684",
-		         path.c_str());
 	return true;
 }

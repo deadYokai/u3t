@@ -1,12 +1,13 @@
-#include <memory>
 #define WIN32_LEAN_AND_MEAN
+#include "override_loader.hpp"
 #include "hook.hpp"
 #include "logs.hpp"
-#include "override_loader.hpp"
+#include "ue3_api.hpp"
 #include "ue3_layout.hpp"
 #include "ue3_patch.hpp"
 #include "util.hpp"
 #include <cstring>
+#include <memory>
 #include <psapi.h>
 #include <sstream>
 #include <unordered_map>
@@ -15,12 +16,6 @@
 #include <windows.h>
 
 static constexpr int kVT_MAX = 64;
-
-struct FNameStack
-{
-	int32_t Index;
-	int32_t Number;
-};
 
 static inline int uobj_serialize_slot()
 {
@@ -76,7 +71,8 @@ struct BufReader
 static void *g_buf_vt[kVT_MAX];
 static bool g_buf_vt_ready = false;
 
-static void __cdecl br_Serialize(BufReader *self, void *dst, int32_t len)
+static void __fastcall br_Serialize(BufReader *self, UE3_EDX void *dst,
+                                    int32_t len)
 {
 	if (len <= 0)
 		return;
@@ -91,13 +87,13 @@ static void __cdecl br_Serialize(BufReader *self, void *dst, int32_t len)
 		         avail);
 }
 
-static int32_t __cdecl br_Tell(BufReader *self)
+static int32_t __fastcall br_Tell(BufReader *self)
 {
 	return self->anchored ? self->serial_off + static_cast<int32_t>(self->pos)
 	                      : static_cast<int32_t>(self->pos);
 }
 
-static void __cdecl br_Seek(BufReader *self, int32_t pos)
+static void __fastcall br_Seek(BufReader *self, UE3_EDX int32_t pos)
 {
 	if (!self->anchored)
 	{
@@ -113,14 +109,17 @@ static void __cdecl br_Seek(BufReader *self, int32_t pos)
 	}
 }
 
-static int32_t __cdecl br_TotalSize(BufReader *self)
+static int32_t __fastcall br_TotalSize(BufReader *self)
 {
 	return static_cast<int32_t>(self->size);
 }
 
-static int32_t __cdecl br_Precache(BufReader *, int32_t, int32_t) { return 1; }
+static int32_t __fastcall br_Precache(BufReader *, UE3_EDX int32_t, int32_t)
+{
+	return 1;
+}
 
-static int32_t __cdecl br_IsError(BufReader *) { return 0; }
+static int32_t __fastcall br_IsError(BufReader *) { return 0; }
 
 static void build_buf_vt(void **real_vt)
 {
@@ -152,24 +151,32 @@ struct FNamePatchCtx
 	void **orig_vt;
 	void **patched_vt;
 	void *active_br;
+	void *fa;
 };
 
-static thread_local FNamePatchCtx tl_fn{};
+static thread_local std::vector<FNamePatchCtx> tl_fn_stack;
 
-static void *__cdecl fname_remap_thunk(void *fa, void *fname_out)
+static void *__fastcall fname_remap_thunk(void *fa, UE3_EDX void *fname_out)
 {
+	if (tl_fn_stack.empty())
+	{
+		log_warn("override: fname_remap_thunk called with no active patch");
+		return fa;
+	}
+	FNamePatchCtx &ctx = tl_fn_stack.back();
+
 	{
 		void *lb = static_cast<uint8_t *>(fa) - ue3().l_FArchiveOff;
 		void *cur = *linker_loader_ptr(lb);
-		if (cur != tl_fn.active_br)
+		if (cur != ctx.active_br)
 		{
-			using FnT = void *(__cdecl *)(void *, void *);
-			return reinterpret_cast<FnT>(tl_fn.orig_fn)(fa, fname_out);
+			using FnT = void *(UE3_THISCALL *)(void *, void *);
+			return reinterpret_cast<FnT>(ctx.orig_fn)(fa, fname_out);
 		}
 	}
 
 	int32_t raw[2] = {};
-	auto *br = static_cast<BufReader *>(tl_fn.active_br);
+	auto *br = static_cast<BufReader *>(ctx.active_br);
 	if (br && br->pos + 8 <= br->size)
 	{
 		memcpy(raw, br->data + br->pos, 8);
@@ -182,16 +189,16 @@ static void *__cdecl fname_remap_thunk(void *fa, void *fname_out)
 	}
 
 	int32_t name_index = 0;  // NAME_None fallback
-	if (raw[0] >= 0 && tl_fn.remap &&
-	    static_cast<size_t>(raw[0]) < tl_fn.remap_size)
+	if (raw[0] >= 0 && ctx.remap &&
+	    static_cast<size_t>(raw[0]) < ctx.remap_size)
 	{
-		name_index = tl_fn.remap[raw[0]];
+		name_index = ctx.remap[raw[0]];
 	}
 	else
 	{
 		log_warn("override: fname_remap: tool_idx=%d out of range "
 		         "(remap_size=%zu) -> None",
-		         raw[0], tl_fn.remap_size);
+		         raw[0], ctx.remap_size);
 	}
 
 	int32_t *out = static_cast<int32_t *>(fname_out);
@@ -201,7 +208,8 @@ static void *__cdecl fname_remap_thunk(void *fa, void *fname_out)
 }
 
 static void install_fname_patch(void *linker,
-                                const override_loader::OverrideRecord &rec)
+                                const override_loader::OverrideRecord &rec,
+                                void *active_br)
 {
 	uint8_t *fa = static_cast<uint8_t *>(linker) + ue3().l_FArchiveOff;
 	void **orig = *reinterpret_cast<void ***>(fa);
@@ -213,27 +221,32 @@ static void install_fname_patch(void *linker,
 	if (fslot >= 0)
 		pv[fslot] = reinterpret_cast<void *>(&fname_remap_thunk);
 
-	tl_fn = {rec.name_remap.data(),
-	         rec.name_remap.size(),
-	         fslot >= 0 ? orig[fslot] : nullptr,
-	         orig,
-	         pv,
-	         nullptr};
+	tl_fn_stack.push_back({rec.name_remap.data(), rec.name_remap.size(),
+	                       fslot >= 0 ? orig[fslot] : nullptr, orig, pv,
+	                       active_br, fa});
 
 	*reinterpret_cast<void ***>(fa) = pv;
-	log_info("override: fname patch fa=%p orig_vt=%p pv=%p", (void *)fa,
-	         (void *)orig, (void *)pv);
+	log_info("override: fname patch fa=%p orig_vt=%p pv=%p depth=%zu",
+	         (void *)fa, (void *)orig, (void *)pv, tl_fn_stack.size());
 }
 
 static void remove_fname_patch(void *linker)
 {
 	uint8_t *fa = static_cast<uint8_t *>(linker) + ue3().l_FArchiveOff;
-	if (!tl_fn.patched_vt)
+	if (tl_fn_stack.empty() || tl_fn_stack.back().fa != fa)
+	{
+		log_warn("override: remove_fname_patch mismatch fa=%p (stack top=%p) — "
+		         "skipping restore to avoid corrupting an unrelated patch",
+		         (void *)fa,
+		         tl_fn_stack.empty() ? nullptr : tl_fn_stack.back().fa);
 		return;
-	*reinterpret_cast<void ***>(fa) = tl_fn.orig_vt;
-	delete[] tl_fn.patched_vt;
-	tl_fn = {};
-	log_info("override: fname patch removed fa=%p", (void *)fa);
+	}
+	const FNamePatchCtx ctx = tl_fn_stack.back();
+	tl_fn_stack.pop_back();
+	*reinterpret_cast<void ***>(fa) = ctx.orig_vt;
+	delete[] ctx.patched_vt;
+	log_info("override: fname patch removed fa=%p depth=%zu", (void *)fa,
+	         tl_fn_stack.size());
 }
 
 static bool safe_read(const void *p, size_t n)
@@ -276,44 +289,34 @@ static void debug_dump_chain(const void *obj)
 	}
 }
 
-static std::wstring get_uobj_path(const void *obj, void *linker)
+static constexpr int kMaxOuterDepth = 16;
+
+static std::wstring get_uobj_path(const void *obj)
 {
 	if (!obj || !ue3().FNameNamesArr || !safe_read(obj, ue3().sizeof_UObject))
 		return {};
 
-	const void *root =
-	    (linker && safe_read(linker_root(linker), ue3().sizeof_UObject))
-	        ? linker_root(linker)
-	        : nullptr;
-
 	std::vector<std::wstring> parts;
 	const void *cur = obj;
-	for (int d = 0; d < 8 && cur && cur != root; ++d)
+	for (int d = 0; d < kMaxOuterDepth && cur; ++d)
 	{
 		if (!safe_read(cur, ue3().sizeof_UObject))
-			break;
+			return {};
 		const int32_t idx = uobj_name_index(cur);
 		const int32_t num = uobj_name_number(cur);
 		std::wstring seg = fname_str(idx);
 		if (seg.empty())
-			break;
+			return {};
 		if (num != 0)
 			seg += L"_" + std::to_wstring(num - 1);
 		parts.push_back(seg);
 		cur = uobj_outer(cur);
 	}
-	if (parts.empty())
+	if (parts.empty() || cur)
 		return {};
 
 	std::wstring path;
-	if (root)
-	{
-		const int32_t pidx = uobj_name_index(root);
-		const int32_t pnum = uobj_name_number(root);
-		path = fname_str(pidx);
-		if (!path.empty() && pnum != 0)
-			path += L"_" + std::to_wstring(pnum - 1);
-	}
+
 	for (auto it = parts.rbegin(); it != parts.rend(); ++it)
 	{
 		if (!path.empty())
@@ -333,7 +336,10 @@ static void build_name_remap(override_loader::OverrideRecord &rec, void *linker)
 	log_info("override: build_name_remap '%ls' nm=%p Num=%d", rec.key.c_str(),
 	         (void *)nm.data, nm.num);
 
-	using FNameInitFn = void(__cdecl *)(void *, const wchar_t *, int32_t);
+	using FNameInitFn = void(UE3_THISCALL *)(void *self, const wchar_t *InName,
+	                                         int32_t InNumber, int32_t FindType,
+	                                         int32_t bSplitName);
+
 	auto fni = reinterpret_cast<FNameInitFn>(ue3().FNameInit);
 	if (!fni)
 	{
@@ -348,7 +354,7 @@ static void build_name_remap(override_loader::OverrideRecord &rec, void *linker)
 	{
 		const std::wstring w = to_wide(rec.tool_names[ti]);
 		FNameStack tmp{};
-		fni(&tmp, w.c_str(), 1);
+		fni(&tmp, w.c_str(), 0, 1, 0);
 		rec.name_remap[ti] = tmp.Index;
 	}
 
@@ -397,7 +403,7 @@ static void build_name_remap(override_loader::OverrideRecord &rec, void *linker)
 	         rec.tool_names.size(), rec.tool_names.size());
 }
 
-using PreloadFn = void(__cdecl *)(void *, void *);
+using PreloadFn = void(UE3_THISCALL *)(void *, void *);
 static PreloadFn g_orig_Preload = nullptr;
 
 static void call_object_serialize(void *obj, void *linker)
@@ -417,7 +423,7 @@ static void call_object_serialize(void *obj, void *linker)
 		*ue3().GSerializedObject = obj;
 	}
 
-	using SerializeFn = void(__cdecl *)(void *, void *);
+	using SerializeFn = void(UE3_THISCALL *)(void *, void *);
 	void **vt = *static_cast<void ***>(obj);
 	auto serialize = reinterpret_cast<SerializeFn>(vt[slot]);
 	serialize(obj, farchive);
@@ -429,7 +435,6 @@ static void call_object_serialize(void *obj, void *linker)
 static void do_override_preload(void *linker, void *obj, void *exp,
                                 override_loader::OverrideRecord &rec)
 {
-	const bool has_remap = !rec.name_remap.empty();
 	const bool vtslot_known = uobj_serialize_slot() >= 0;
 
 	if (uobj_has_flag(obj, RF_ClassDefaultObject) || !vtslot_known)
@@ -454,6 +459,7 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 	if (!rec.name_remap_ready)
 		build_name_remap(rec, linker);
 
+	const bool has_remap = !rec.name_remap.empty();
 	BufReader br{};
 	br.vt = g_buf_vt;
 	copy_live_version(&br.ar, linker);
@@ -466,8 +472,7 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 
 	if (has_remap)
 	{
-		install_fname_patch(linker, rec);
-		tl_fn.active_br = br_ptr;
+		install_fname_patch(linker, rec, br_ptr);
 	}
 
 	void *saved_nm_data = nullptr;
@@ -484,7 +489,11 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 		            static_cast<int32_t>(shadow_nm.size()));
 	}
 
+#if _WIN64
 	br_Seek(&br, exp_serial_offset(exp));
+#else
+	br_Seek(&br, nullptr, exp_serial_offset(exp));
+#endif
 
 	uobj_clear_flag(obj, RF_NeedLoad);
 
@@ -509,7 +518,7 @@ static inline void orig_preload(void *linker, void *obj)
 		g_orig_Preload(linker_farchive(linker), obj);
 }
 
-static void __cdecl hooked_Preload(void *farchive, void *obj)
+static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
 {
 	void *linker = farchive
 	                   ? static_cast<uint8_t *>(farchive) - ue3().l_FArchiveOff
@@ -539,7 +548,7 @@ static void __cdecl hooked_Preload(void *farchive, void *obj)
 		return;
 	}
 
-	std::wstring path = get_uobj_path(obj, linker);
+	std::wstring path = get_uobj_path(obj);
 	if (path.empty())
 	{
 		orig_preload(linker, obj);
@@ -670,14 +679,10 @@ static void scan_package_dir(const std::wstring &pkg_dir,
 			continue;
 		}
 
-		std::wstring key = pkg_name + L"." + stem;
+		std::wstring key = stem;
 		override_loader::OverrideRecord rec;
 		rec.key = key;
 		rec.bin = std::move(bin);
-		rec.upk_version =
-		    lm.cfg.upk_version ? int32_t(lm.cfg.upk_version) : 801;
-		rec.license_version =
-		    lm.cfg.license_version ? int32_t(lm.cfg.license_version) : 0;
 		if (names)
 			rec.tool_names = *names;
 		g_overrides[key] = std::move(rec);

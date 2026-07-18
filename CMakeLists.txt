@@ -24,6 +24,10 @@ set(ZYDIS_FEATURE_DECODER ON CACHE BOOL "" FORCE)
 set(ZYDIS_FEATURE_AVX512 ON CACHE BOOL "" FORCE)
 set(ZYDIS_FEATURE_KNC ON CACHE BOOL "" FORCE)
 
+set(SOL2_TESTS OFF CACHE BOOL "" FORCE)
+set(SOL2_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SOL2_DOCS OFF CACHE BOOL "" FORCE)
+
 add_subdirectory(third_party/zydis EXCLUDE_FROM_ALL)
 
 if(MINGW)
@@ -39,7 +43,14 @@ endif()
 
 file(GLOB WRAPPER_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 
-add_library(dinput8 SHARED ${WRAPPER_SOURCES})
+file(GLOB LUA_SRC CONFIGURE_DEPENDS third_party/lua/l*.c)
+list(
+    REMOVE_ITEM LUA_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/lua.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/luac.c
+)
+
+add_library(dinput8 SHARED ${LUA_SRC} ${WRAPPER_SOURCES})
 
 target_include_directories(
     dinput8
@@ -47,7 +58,11 @@ target_include_directories(
         src
         third_party/zydis/include
         third_party/zydis/dependencies/zycore/include
+        third_party/sol2/include
+        third_party/lua
 )
+
+target_compile_definitions(dinput8 PRIVATE SOL_LUA_VERSION=504)
 
 target_link_libraries(dinput8 PRIVATE Zydis psapi)
 
@@ -55,7 +70,7 @@ set_target_properties(dinput8 PROPERTIES PREFIX "")
 if(MSVC)
     target_link_options(
         dinput8
-        PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/dinput8.def"
+        PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/dinput8.def" ""
     )
 else()
     target_link_options(
@@ -67,7 +82,7 @@ endif()
 if(MINGW)
     target_compile_options(
         dinput8
-        PRIVATE -fno-stack-protector -U_FORTIFY_SOURCE
+        PRIVATE -fno-stack-protector -U_FORTIFY_SOURCE -Wa,-mbig-obj
     )
     target_link_options(dinput8 PRIVATE -static-libgcc -static-libstdc++)
 endif()

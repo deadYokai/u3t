@@ -18,6 +18,8 @@ namespace anchor
 
 	ModuleImage image_of(HMODULE mod);
 
+	void *only(const std::vector<void *> &v, const char *what);
+
 	std::vector<const void *> find_wstr_all(const ModuleImage &img,
 	                                        const wchar_t *needle);
 	std::vector<const void *> find_cstr_all(const ModuleImage &img,

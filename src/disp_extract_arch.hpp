@@ -1,4 +1,5 @@
 #pragma once
+#include "Zydis/Register.h"
 #include <cstddef>
 
 namespace dxa
@@ -18,4 +19,7 @@ namespace dxa
 
 	bool load_and_indexed_store_to_global(const void *b, const void *e,
 	                                      void **global_ptr, int scale);
+
+	int gpr_idx(ZydisRegister reg);
+
 }  // namespace dxa

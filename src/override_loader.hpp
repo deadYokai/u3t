@@ -9,8 +9,6 @@ namespace override_loader
 	{
 		std::wstring key;
 		std::vector<uint8_t> bin;
-		int32_t upk_version = 801;
-		int32_t license_version = 0;
 		std::vector<std::string> tool_names;
 		std::vector<int32_t> name_remap;
 		bool name_remap_ready = false;

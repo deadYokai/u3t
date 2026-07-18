@@ -24,8 +24,6 @@ struct ModConfig
 	std::string version;
 	std::string description;
 	bool enabled = true;
-	uint32_t upk_version = 0;
-	uint32_t license_version = 0;
 
 	std::vector<std::string> content_path;
 

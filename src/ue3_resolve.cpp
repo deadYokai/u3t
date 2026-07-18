@@ -19,19 +19,6 @@ namespace
 	using anchor::ModuleImage;
 	constexpr ptrdiff_t PS = static_cast<ptrdiff_t>(sizeof(void *));
 
-	void *only(const std::vector<void *> &v, const char *what)
-	{
-		if (v.empty())
-		{
-			log_warn("resolve: '%s' anchor matched 0 functions", what);
-			return nullptr;
-		}
-		if (v.size() > 1)
-			log_warn("resolve: '%s' anchor ambiguous (%zu), using first", what,
-			         v.size());
-		return v.front();
-	}
-
 	void fill_formula_offsets(UE3Layout &L)
 	{
 		L.o_ObjectFlags = PS + 4;
@@ -83,9 +70,9 @@ bool ue3_resolve(UE3Layout &L)
 	}
 	fill_formula_offsets(L);
 
-	L.GetPackageLinker =
-	    only(anchor::functions_referencing_wstr(img, L"PackageResolveFailed"),
-	         "GetPackageLinker");
+	L.GetPackageLinker = anchor::only(
+	    anchor::functions_referencing_wstr(img, L"PackageResolveFailed"),
+	    "GetPackageLinker");
 	if (L.GetPackageLinker)
 	{
 		void **g = nullptr;
@@ -97,7 +84,7 @@ bool ue3_resolve(UE3Layout &L)
 			log_warn("resolve: GPackageFileCache not found");
 	}
 
-	L.StaticFindObjectFast = only(
+	L.StaticFindObjectFast = anchor::only(
 	    anchor::functions_referencing_wstr(
 	        img,
 	        L"Illegal call to StaticFindObjectFast() while serializing object "
@@ -111,11 +98,11 @@ bool ue3_resolve(UE3Layout &L)
 			if (L.GetPackageLinker &&
 			    anchor::function_calls(img, fn, L.GetPackageLinker))
 				hits.push_back(fn);
-		L.StaticLoadObject = only(hits, "StaticLoadObject");
+		L.StaticLoadObject = anchor::only(hits, "StaticLoadObject");
 	}
 
-	L.Preload =
-	    only(anchor::functions_referencing_wstr(img, L"SerialSize"), "Preload");
+	L.Preload = anchor::only(
+	    anchor::functions_referencing_wstr(img, L"SerialSize"), "Preload");
 	if (L.Preload)
 	{
 		uint8_t *end = anchor::function_end(img, L.Preload);
@@ -151,8 +138,10 @@ bool ue3_resolve(UE3Layout &L)
 				break;
 			}
 		}
+
 		if (!L.l_Loader)
 			log_warn("resolve: Loader offset not derived");
+
 		if (L.l_Loader)
 			L.l_OriginalLoader = L.l_Loader + PS;
 
@@ -168,9 +157,17 @@ bool ue3_resolve(UE3Layout &L)
 				log_warn("resolve: GSerializedObject/Serialize not found");
 		}
 
-		if (L.l_FArchiveOff && L.l_Loader &&
-		    !resolve_farchive_slots(L.ar, L.Preload, L.l_FArchiveOff,
-		                            L.l_Loader))
+		void *fname_op = anchor::only(
+		    anchor::functions_referencing_wstr(img, L"Bad name index %i/%i"),
+		    "operator<<(FName)");
+		void *seek_impl =
+		    anchor::only(anchor::functions_referencing_wstr(
+		                     img, L"SetFilePointer Failed %i/%i: %i %s"),
+		                 "GetError (via FArchiveFileReaderWindows::Seek)");
+
+		if (L.l_FArchiveOff && L.l_Loader && fname_op &&
+		    !resolve_farchive_slots(L.ar, L.Preload, fname_op, seek_impl,
+		                            L.l_FArchiveOff, L.l_Loader))
 			log_warn("resolve: FArchive slots not fully derived "
 			         "(validated=%d Serialize=%d Tell=%d) — check this build",
 			         (int)L.ar.validated, L.ar.Serialize, L.ar.Tell);

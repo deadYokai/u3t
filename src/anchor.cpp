@@ -1,12 +1,27 @@
 #include <string>
 #define WIN32_LEAN_AND_MEAN
 #include "anchor.hpp"
+#include "logs.hpp"
+
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <cstring>
 
 namespace anchor
 {
+
+	void *only(const std::vector<void *> &v, const char *what)
+	{
+		if (v.empty())
+		{
+			log_warn("resolve: '%s' anchor matched 0 functions", what);
+			return nullptr;
+		}
+		if (v.size() > 1)
+			log_warn("resolve: '%s' anchor ambiguous (%zu), using first", what,
+			         v.size());
+		return v.front();
+	}
 
 	static bool decodes_cleanly_to(const uint8_t *start,
 	                               const uint8_t *interior)
@@ -107,44 +122,63 @@ namespace anchor
 			return out;
 		const auto target = reinterpret_cast<uintptr_t>(data);
 
-		if (img.x64)
+		ZydisDecoder dec;
+		ZydisDecoderInit(&dec,
+		                 img.x64 ? ZYDIS_MACHINE_MODE_LONG_64
+		                         : ZYDIS_MACHINE_MODE_LEGACY_32,
+		                 img.x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
+
+		uint8_t *p = img.text;
+		uint8_t *end = img.text + img.text_size;
+
+		while (p < end)
 		{
-			uint8_t *p = img.text;
-			uint8_t *end = img.text + img.text_size - 7;
-			for (; p < end; ++p)
+			ZydisDecodedInstruction in;
+			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, end - p, &in, ops)))
 			{
-				const uint8_t rex = p[0];
-				if (rex != 0x48 && rex != 0x49 && rex != 0x4C && rex != 0x4D)
+				++p;
+				continue;
+			}
+
+			for (uint8_t i = 0; i < in.operand_count_visible; ++i)
+			{
+				const auto &op = ops[i];
+				uintptr_t tgt;
+
+				if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+				    op.mem.base == ZYDIS_REGISTER_RIP &&
+				    op.mem.disp.has_displacement)
+				{
+					tgt = reinterpret_cast<uintptr_t>(p + in.length) +
+					      static_cast<int32_t>(op.mem.disp.value);
+				}
+				else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+				         op.mem.base == ZYDIS_REGISTER_NONE &&
+				         op.mem.index == ZYDIS_REGISTER_NONE &&
+				         op.mem.disp.has_displacement)
+				{
+					tgt = img.x64
+					          ? static_cast<uintptr_t>(op.mem.disp.value)
+					          : static_cast<uintptr_t>(
+					                static_cast<uint32_t>(op.mem.disp.value));
+				}
+				else if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+				         !op.imm.is_relative)
+				{
+					tgt = static_cast<uintptr_t>(op.imm.value.u);
+				}
+				else
+				{
 					continue;
-				if (p[1] != 0x8D)
-					continue;
-				if ((p[2] & 0xC7) != 0x05)
-					continue;
-				int32_t disp;
-				memcpy(&disp, p + 3, 4);
-				auto tgt = reinterpret_cast<uintptr_t>(p + 7) + disp;
+				}
 				if (tgt == target)
+				{
 					out.push_back(p);
+					break;
+				}
 			}
-		}
-		else
-		{
-			uint32_t va32 = static_cast<uint32_t>(target);
-			uint8_t *p = img.text;
-			uint8_t *end = img.text + img.text_size - 5;
-			for (; p < end; ++p)
-			{
-				uint32_t v;
-				memcpy(&v, p, 4);
-				if (v != va32)
-					continue;
-				const uint8_t op = p[-1];
-				const bool push_imm = (op == 0x68);
-				const bool mov_imm = (op >= 0xB8 && op <= 0xBF);
-				const bool modrm_disp = true;
-				if (push_imm || mov_imm || modrm_disp)
-					out.push_back(p - 1);
-			}
+			p += in.length;
 		}
 		return out;
 	}
@@ -154,6 +188,27 @@ namespace anchor
 		IMAGE_NT_HEADERS *nt = nt_of(img.base);
 		return nt->OptionalHeader
 		    .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+	}
+
+	static const IMAGE_RUNTIME_FUNCTION_ENTRY *
+	chain_to_primary(const ModuleImage &img,
+	                 const IMAGE_RUNTIME_FUNCTION_ENTRY *rf)
+	{
+		for (int hop = 0; hop < 8 && rf; ++hop)
+		{
+			const uint8_t *ui = img.base + rf->UnwindData;
+			const uint8_t flags = (ui[0] >> 3) & 0x1F;
+			if (!(flags & 0x4))
+				return rf;
+
+			const uint8_t count_of_codes = ui[2];
+			size_t codes_bytes = static_cast<size_t>(count_of_codes) * 2;
+			if (codes_bytes % 4 != 0)
+				codes_bytes += 2;
+			rf = reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY *>(
+			    ui + 4 + codes_bytes);
+		}
+		return rf;
 	}
 
 	void *function_entry(const ModuleImage &img, const void *interior)
@@ -181,8 +236,10 @@ namespace anchor
 						lo = mid + 1;
 					else
 					{
-						uint32_t begin = rf[mid].BeginAddress;
-						return img.base + begin;
+						const IMAGE_RUNTIME_FUNCTION_ENTRY *primary =
+						    chain_to_primary(img, &rf[mid]);
+						return img.base + (primary ? primary->BeginAddress
+						                           : rf[mid].BeginAddress);
 					}
 				}
 				return nullptr;

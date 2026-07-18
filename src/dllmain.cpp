@@ -1,8 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
+#include "anchor.hpp"
 #include "hook.hpp"
 #include "logs.hpp"
+#include "lua_host.hpp"
 #include "mod_loader.hpp"
 #include "override_loader.hpp"
+#include "ue3_api.hpp"
 #include "ue3_layout.hpp"
 #include "util.hpp"
 #include <unknwn.h>
@@ -12,8 +15,26 @@ static HMODULE g_sys_di8 = nullptr;
 static FARPROC g_real_di8 = nullptr;
 static HMODULE g_hmod = nullptr;
 
+using EngineLoopInitFn = int(UE3_THISCALL *)(void *);
+static EngineLoopInitFn g_orig_engine_loop_init = nullptr;
+
 static HMODULE load_system_dinput8()
 {
+	std::wstring orig = get_exe_dir() + L"\\dinput8.orig.dll";
+
+	DWORD attr = GetFileAttributesW(orig.c_str());
+	if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		log_info("loading local original dinput8: %ls", orig.c_str());
+
+		HMODULE h = LoadLibraryW(orig.c_str());
+		if (h)
+			return h;
+
+		log_err("LoadLibraryW(%ls) failed (err=%lu)", orig.c_str(),
+		        GetLastError());
+	}
+
 	char sys[MAX_PATH]{};
 #ifdef _WIN64
 	GetSystemDirectoryA(sys, MAX_PATH);
@@ -57,6 +78,90 @@ static void init_dinput8()
 	}
 }
 
+static int __fastcall engine_loop_init(void *this_ptr)
+{
+	log_info("engine_loop_init: GEngineLoop::Init reached — resolving "
+	         "UE3 layout");
+
+	if (!ue3_resolve(ue3()))
+	{
+		log_err("engine_loop_init: UE3 layout not resolved — mods "
+		        "will not load");
+	}
+	else
+	{
+		const UE3Layout &L = ue3();
+		log_info("engine_loop_init: FNameInit            = %p", L.FNameInit);
+		log_info("engine_loop_init: StaticFindObjectFast = %p",
+		         L.StaticFindObjectFast);
+		log_info("engine_loop_init: StaticLoadObject     = %p",
+		         L.StaticLoadObject);
+		log_info("engine_loop_init: Preload              = %p", L.Preload);
+		log_info("engine_loop_init: GPackageFileCache    = %p",
+		         static_cast<void *>(L.GPackageFileCache));
+		log_info("engine_loop_init: FName::Names         = %p  "
+		         "(str_off=%zu wf=%d)",
+		         static_cast<void *>(L.FNameNamesArr), L.name.str_off,
+		         (int)L.name.with_flags);
+		log_info("engine_loop_init: FArchive slots       = "
+		         "Serialize=%d Tell=%d Seek=%d Precache=%d SerializeName=%d "
+		         "(validated=%d)",
+		         L.ar.Serialize, L.ar.Tell, L.ar.Seek, L.ar.Precache,
+		         L.ar.SerializeName, (int)L.ar.validated);
+
+		log_info("engine_loop_init: registering content paths");
+		mod_loader::register_content();
+
+		log_info("engine_loop_init: installing redirect (SLO) hook");
+		mod_loader::install_hooks();
+
+		log_info("engine_loop_init: discovering + installing "
+		         "overrides (Preload hook)");
+		override_loader::discover(mod_loader::loaded_mods());
+		override_loader::install_hooks();
+
+		log_info("engine_loop_init: committing hooks");
+		hook::install_all();
+
+		lua_host::init();
+
+		log_info("engine_loop_init: ready");
+	}
+
+	return g_orig_engine_loop_init(this_ptr);
+}
+
+static bool install_engine_loop_init_hook()
+{
+	anchor::ModuleImage img = anchor::image_of(nullptr);
+	if (!img.ok)
+	{
+		log_err("install_engine_loop_init_hook: image_of failed");
+		return false;
+	}
+
+	auto hits = anchor::functions_referencing_wstr(img, L"NoTextureStreaming");
+	if (hits.size() != 1)
+	{
+		log_err("install_engine_loop_init_hook: anchor ambiguous/missing "
+		        "(%zu hits) — check this build",
+		        hits.size());
+		return false;
+	}
+
+	void *target = hits.front();
+	log_info("install_engine_loop_init_hook: GEngineLoop::Init = %p", target);
+
+	hook::add(target, reinterpret_cast<void *>(&engine_loop_init),
+	          reinterpret_cast<void **>(&g_orig_engine_loop_init));
+	log_info("engine_loop_init: committing hooks");
+	hook::install_all();
+
+	log_info("engine_loop_init: ready");
+
+	return g_orig_engine_loop_init != nullptr;
+}
+
 static DWORD WINAPI init_thread(LPVOID)
 {
 	logs::init(get_exe_dir());
@@ -71,46 +176,20 @@ static DWORD WINAPI init_thread(LPVOID)
 
 	log_info("module = %p", static_cast<void *>(g_hmod));
 
+	lua_host::configure_from_cmdline();
+
 	init_dinput8();
 
 	log_info("init_thread: discovering mods");
 	mod_loader::discover();
 
-	log_info("init_thread: resolving UE3 layout");
-	if (!ue3_resolve(ue3()))
+	log_info("init_thread: installing GEngineLoop::Init hook");
+	if (!install_engine_loop_init_hook())
 	{
-		log_err("init_thread: UE3 layout not resolved — aborting");
+		log_err(
+		    "init_thread: GEngineLoop::Init hook install failed — aborting");
 		return 1;
 	}
-
-	const UE3Layout &L = ue3();
-	log_info("init_thread: FNameInit            = %p", L.FNameInit);
-	log_info("init_thread: StaticFindObjectFast = %p", L.StaticFindObjectFast);
-	log_info("init_thread: StaticLoadObject     = %p", L.StaticLoadObject);
-	log_info("init_thread: Preload              = %p", L.Preload);
-	log_info("init_thread: GPackageFileCache    = %p",
-	         static_cast<void *>(L.GPackageFileCache));
-	log_info("init_thread: FName::Names         = %p  (str_off=%zu wf=%d)",
-	         static_cast<void *>(L.FNameNamesArr), L.name.str_off,
-	         (int)L.name.with_flags);
-	log_info("init_thread: FArchive slots       = "
-	         "Serialize=%d Tell=%d Seek=%d Precache=%d SerializeName=%d "
-	         "(validated=%d)",
-	         L.ar.Serialize, L.ar.Tell, L.ar.Seek, L.ar.Precache,
-	         L.ar.SerializeName, (int)L.ar.validated);
-
-	log_info("init_thread: registering content paths");
-	mod_loader::register_content();
-
-	log_info("init_thread: installing redirect (SLO) hook");
-	mod_loader::install_hooks();
-
-	log_info("init_thread: discovering + installing overrides (Preload hook)");
-	override_loader::discover(mod_loader::loaded_mods());
-	override_loader::install_hooks();
-
-	log_info("init_thread: committing hooks");
-	hook::install_all();
 
 	log_info("init_thread: ready");
 	return 0;

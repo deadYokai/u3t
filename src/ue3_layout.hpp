@@ -8,6 +8,12 @@
 
 #include <windows.h>
 
+struct FNameStack
+{
+	int32_t Index;
+	int32_t Number;
+};
+
 struct FArchiveFields
 {
 	int32_t ArVer, ArNetVer, ArLicenseeVer, ArIsLoading, ArIsSaving,

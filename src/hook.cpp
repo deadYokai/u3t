@@ -10,6 +10,8 @@
 #include <vector>
 #include <windows.h>
 
+#include "disp_extract_arch.hpp"
+
 #ifdef _WIN64
 
 #ifndef UWOP_PUSH_NONVOL
@@ -23,45 +25,6 @@
 #define UWOP_SAVE_XMM128_FAR 9
 #define UWOP_PUSH_MACHFRAME 10
 #endif
-
-static int zydis_reg_to_unwind_num(ZydisRegister r)
-{
-	switch (r)
-	{
-		case ZYDIS_REGISTER_RAX:
-			return 0;
-		case ZYDIS_REGISTER_RCX:
-			return 1;
-		case ZYDIS_REGISTER_RDX:
-			return 2;
-		case ZYDIS_REGISTER_RBX:
-			return 3;
-		case ZYDIS_REGISTER_RBP:
-			return 5;
-		case ZYDIS_REGISTER_RSI:
-			return 6;
-		case ZYDIS_REGISTER_RDI:
-			return 7;
-		case ZYDIS_REGISTER_R8:
-			return 8;
-		case ZYDIS_REGISTER_R9:
-			return 9;
-		case ZYDIS_REGISTER_R10:
-			return 10;
-		case ZYDIS_REGISTER_R11:
-			return 11;
-		case ZYDIS_REGISTER_R12:
-			return 12;
-		case ZYDIS_REGISTER_R13:
-			return 13;
-		case ZYDIS_REGISTER_R14:
-			return 14;
-		case ZYDIS_REGISTER_R15:
-			return 15;
-		default:
-			return -1;
-	}
-}
 
 struct UnwindCode
 {
@@ -120,7 +83,7 @@ static bool write_unwind_data(uint8_t *page_base, size_t tramp_code_sz,
 		    ins.operand_count_visible >= 1 &&
 		    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
 		{
-			int n = zydis_reg_to_unwind_num(ops[0].reg.value);
+			int n = dxa::gpr_idx(ops[0].reg.value);
 			if (n >= 0)
 			{
 				UCode c;
@@ -256,52 +219,112 @@ namespace hook
 
 	static size_t emit_jmp(uint8_t *at, void *target)
 	{
+		ZydisEncoderRequest req;
+		memset(&req, 0, sizeof(req));
+		req.machine_mode = kMachineMode;
+
 #ifdef _WIN64
-		at[0] = 0x48;  // REX.W
-		at[1] = 0xB8;  // mov rax, imm64
-		memcpy(at + 2, &target, 8);
+		req.mnemonic = ZYDIS_MNEMONIC_MOV;
+		req.operand_count = 2;
+		req.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+		req.operands[0].reg.value = ZYDIS_REGISTER_RAX;
+		req.operands[1].type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+		req.operands[1].imm.u =
+		    static_cast<ZyanU64>(reinterpret_cast<uintptr_t>(target));
 
-		at[10] = 0xFF;  // jmp rax
-		at[11] = 0xE0;
+		ZyanUSize len = ZYDIS_MAX_INSTRUCTION_LENGTH;
+		if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&req, at, &len)))
+		{
+			log_err("hook: encode 'mov rax, imm64' failed at %p", at);
+			return 0;
+		}
+		size_t written = static_cast<size_t>(len);
 
-		return 12;
+		memset(&req, 0, sizeof(req));
+		req.machine_mode = kMachineMode;
+		req.mnemonic = ZYDIS_MNEMONIC_JMP;
+		req.operand_count = 1;
+		req.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+		req.operands[0].reg.value = ZYDIS_REGISTER_RAX;
+
+		len = ZYDIS_MAX_INSTRUCTION_LENGTH;
+		if (ZYAN_FAILED(
+		        ZydisEncoderEncodeInstruction(&req, at + written, &len)))
+		{
+			log_err("hook: encode 'jmp rax' failed at %p", at);
+			return 0;
+		}
+		written += static_cast<size_t>(len);
+		return written;
 #else
-		auto rel =
-		    static_cast<int32_t>((uintptr_t)target - ((uintptr_t)at + 5));
-		at[0] = 0xE9;
-		memcpy(at + 1, &rel, 4);
-		return 5;
+		req.mnemonic = ZYDIS_MNEMONIC_JMP;
+		req.branch_width = ZYDIS_BRANCH_WIDTH_32;
+		req.operand_count = 1;
+		req.operands[0].type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+		req.operands[0].imm.u =
+		    static_cast<ZyanU64>(reinterpret_cast<uintptr_t>(target));
+
+		ZyanUSize len = ZYDIS_MAX_INSTRUCTION_LENGTH;
+		if (ZYAN_FAILED(ZydisEncoderEncodeInstructionAbsolute(
+		        &req, at, &len,
+		        static_cast<ZyanU64>(reinterpret_cast<uintptr_t>(at)))))
+		{
+			log_err("hook: encode 'jmp rel32' failed at %p", at);
+			return 0;
+		}
+		return static_cast<size_t>(len);
 #endif
 	}
 
 	static size_t emit_jmp_indirect(uint8_t *at, void *target)
 	{
 #ifdef _WIN64
-		// FF 25 00 00 00 00  — JMP QWORD PTR [RIP+0]
-		// [RIP+0] immediately follows this 6-byte instruction, holding the
-		// target.
-		at[0] = 0xFF;
-		at[1] = 0x25;
-		at[2] = 0x00;
-		at[3] = 0x00;
-		at[4] = 0x00;
-		at[5] = 0x00;
-		memcpy(at + 6, &target, 8);
-		return 14;
+		constexpr size_t kInsnLen = 6;
+
+		ZydisEncoderRequest req;
+		memset(&req, 0, sizeof(req));
+		req.machine_mode = kMachineMode;
+		req.mnemonic = ZYDIS_MNEMONIC_JMP;
+		req.operand_count = 1;
+		req.operands[0].type = ZYDIS_OPERAND_TYPE_MEMORY;
+		req.operands[0].mem.base = ZYDIS_REGISTER_RIP;
+		req.operands[0].mem.index = ZYDIS_REGISTER_NONE;
+		req.operands[0].mem.scale = 0;
+		req.operands[0].mem.size = 8;
+		req.operands[0].mem.displacement =
+		    static_cast<ZyanI64>(reinterpret_cast<uintptr_t>(at) + kInsnLen);
+
+		ZyanUSize len = ZYDIS_MAX_INSTRUCTION_LENGTH;
+		if (ZYAN_FAILED(ZydisEncoderEncodeInstructionAbsolute(
+		        &req, at, &len,
+		        static_cast<ZyanU64>(reinterpret_cast<uintptr_t>(at)))))
+		{
+			log_err("hook: encode 'jmp [rip+0]' failed at %p", at);
+			return 0;
+		}
+		if (len != kInsnLen)
+		{
+			log_err("hook: 'jmp [rip+0]' encoded to unexpected length "
+			        "%zu (expected %zu) at %p",
+			        static_cast<size_t>(len), kInsnLen, at);
+			return 0;
+		}
+
+		memcpy(at + kInsnLen, &target, 8);
+		return kInsnLen + 8;
 #else
 		// x86: no RAX capture in prologues, ordinary JMP is fine.
 		return emit_jmp(at, target);
 #endif
 	}
 
-	static size_t jmp_size_at([[maybe_unused]] void *at,
-	                          [[maybe_unused]] void *target)
+	static size_t jmp_size_at([[maybe_unused]] void *at, void *target)
 	{
-#ifdef _WIN64
-		return 14;
-#else
-		return 5;
-#endif
+		uint8_t scratch[32] = {};
+		size_t n = emit_jmp(scratch, target);
+		if (n == 0)
+			log_err("hook: jmp_size_at probe failed for target %p", target);
+		return n;
 	}
 
 	static size_t
@@ -439,9 +462,18 @@ namespace hook
 
 	static bool install_one(HookEntry &h)
 	{
+		if (h.installed)
+			return true;
 		auto *tgt = static_cast<uint8_t *>(h.target);
 
 		const size_t min_patch = jmp_size_at(tgt, h.detour);
+
+		if (min_patch == 0)
+		{
+			log_err("hook: %p — could not determine redirect-jmp size",
+			        h.target);
+			return false;
+		}
 
 		struct InstrRec
 		{

@@ -6,6 +6,8 @@ CompileFlags:
     - -I../src
     - -I../third_party/zydis/include
     - -I../third_party/zydis/dependencies/zycore/include
+    - -I../third_party/sol2/include
+    - -I../third_party/lua
     - -I/usr/x86_64-w64-mingw32/include
   Compiler: x86_64-w64-mingw32-g++
 

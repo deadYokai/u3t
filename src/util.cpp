@@ -39,3 +39,55 @@ std::string to_narrow(const std::wstring &w)
 		s.pop_back();
 	return s;
 }
+
+bool is_mnemonic(const ZydisDecodedInstruction &in,
+                 std::initializer_list<ZydisMnemonic> mnemonics)
+{
+	for (ZydisMnemonic m : mnemonics)
+		if (in.mnemonic == m)
+			return true;
+	return false;
+}
+
+bool is_flow_break(const ZydisDecodedInstruction &in)
+{
+	return is_mnemonic(
+	    in, {ZYDIS_MNEMONIC_CALL, ZYDIS_MNEMONIC_RET, ZYDIS_MNEMONIC_JMP});
+}
+
+bool is_reg(const ZydisDecodedOperand &op)
+{
+	return op.type == ZYDIS_OPERAND_TYPE_REGISTER;
+}
+
+bool is_reg(const ZydisDecodedOperand &op, ZydisRegister r)
+{
+	return is_reg(op) && op.reg.value == r;
+}
+
+bool is_imm(const ZydisDecodedOperand &op)
+{
+	return op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+}
+
+bool is_imm(const ZydisDecodedOperand &op, uint64_t v)
+{
+	return is_imm(op) && op.imm.value.u == v;
+}
+
+bool is_mem(const ZydisDecodedOperand &op)
+{
+	return op.type == ZYDIS_OPERAND_TYPE_MEMORY;
+}
+
+bool is_mem_reg(const ZydisDecodedOperand &op)
+{
+	return is_mem(op) && op.mem.base != ZYDIS_REGISTER_NONE &&
+	       op.mem.base != ZYDIS_REGISTER_RIP;
+}
+
+bool is_mem_rip(const ZydisDecodedOperand &op)
+{
+	return is_mem(op) && op.mem.base == ZYDIS_REGISTER_RIP &&
+	       op.mem.disp.has_displacement;
+}

@@ -28,7 +28,7 @@ namespace
 	std::vector<LoadedMod> g_mods;
 
 	static StaticLoadObjectFn g_orig_slo = nullptr;
-	static thread_local bool s_in_hook = false;  // reentrancy guard
+	static thread_local bool s_in_hook = false;
 
 	static void *__cdecl
 	hook_StaticLoadObject(void *InClass, void *InOuter, const wchar_t *Name,
@@ -159,8 +159,6 @@ namespace
 			}
 			if (lm.cfg.name.empty())
 				lm.cfg.name = to_narrow(fd.cFileName);
-			if (lm.cfg.upk_version == 0)
-				lm.cfg.upk_version = 684;
 
 			g_mods.push_back(std::move(lm));
 			log_info("mod_loader: found '%s'  v%s  by %s  deps=[%zu]",

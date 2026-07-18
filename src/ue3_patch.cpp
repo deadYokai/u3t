@@ -1,4 +1,5 @@
 #include "ue3_patch.hpp"
+#include "ue3_api.hpp"
 #include "ue3_layout.hpp"
 
 #include <cstdint>
@@ -58,14 +59,8 @@ namespace
 		if (!L.FNameInit)
 			return false;
 		out.Index = out.Number = 0;
-#if defined(_WIN64)
-		using Fn = void (*)(void *, const wchar_t *, int, int, int);
-		reinterpret_cast<Fn>(L.FNameInit)(&out, name, 0, /*FNAME_Add*/ 1,
-		                                  /*bSplitName*/ 1);
-#else
-		using Fn = void(__thiscall *)(void *, const wchar_t *, int, int, int);
+		using Fn = void(UE3_THISCALL *)(void *, const wchar_t *, int, int, int);
 		reinterpret_cast<Fn>(L.FNameInit)(&out, name, 0, 1, 1);
-#endif
 		return true;
 	}
 }  // namespace

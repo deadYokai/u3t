@@ -1,4 +1,5 @@
 #pragma once
+
 #include <cstddef>
 
 struct FArchiveSlots
@@ -14,5 +15,6 @@ struct FArchiveSlots
 	bool validated = false;  // anchors matched the standard layout
 };
 
-bool resolve_farchive_slots(FArchiveSlots &out, void *preload,
-                            ptrdiff_t farchive_off, ptrdiff_t loader_off);
+bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
+                            void *seek_impl, ptrdiff_t farchive_off,
+                            ptrdiff_t loader_off);
