@@ -5,6 +5,7 @@
 #include <sol/sol.hpp>
 
 #include "addr_cache.hpp"
+#include "loader_config.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,7 @@ namespace
 	bool g_enabled = true;
 	bool g_verbose = false;
 	bool g_cfg_done = false;
+	bool g_nolua_switch = false;
 
 	std::wstring g_cmdline;
 	std::vector<std::wstring> g_switches;
@@ -788,7 +790,8 @@ namespace
 		L.ok = L.Localize && L.GetSectionPrivate && L.FindFile &&
 		       L.SectionAdd && L.SectionRemoveKey &&
 		       (!L.fname_keyed || L.KeyCtor);
-		if (!from_cache && L.ok) {
+		if (!from_cache && L.ok)
+		{
 			addr_cache::store_lua(L);
 			addr_cache::save();
 		}
@@ -857,7 +860,7 @@ namespace
 		                 {
 			                 sol::table t = lua.create_table();
 			                 int i = 1;
-			                 for (const auto &lm : mod_loader::loaded_mods())
+			                 for (const auto &lm : mod_loader::enabled_mods())
 				                 t[i++] = lua.create_table_with(
 				                     "name", lm.cfg.name, "version",
 				                     lm.cfg.version, "author", lm.cfg.author);
@@ -1118,7 +1121,7 @@ namespace
 
 	void run_startup_scripts()
 	{
-		for (const auto &lm : mod_loader::loaded_mods())
+		for (const auto &lm : mod_loader::enabled_mods())
 		{
 			std::wstring path = lm.dir_w + L"\\main.lua";
 
@@ -1165,7 +1168,10 @@ namespace lua_host
 			std::wstring body = lower(tok.substr(1));
 
 			if (body == L"nolua")
+			{
+				g_nolua_switch = true;
 				g_enabled = false;
+			}
 			else if (body == L"luaverbose")
 				g_verbose = true;
 			else if (body.rfind(L"lua=", 0) == 0)
@@ -1188,9 +1194,12 @@ namespace lua_host
 	{
 		configure_from_cmdline();
 
+		g_enabled = loader_config::settings().lua && !g_nolua_switch;
+		g_verbose = g_verbose || loader_config::settings().lua_verbose;
+
 		if (!g_enabled)
 		{
-			log_info("lua: disabled via -nolua");
+			log_info("lua: disabled");
 			return;
 		}
 		if (g_lua)

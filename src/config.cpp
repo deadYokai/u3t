@@ -1,9 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include "config.hpp"
 #include "logs.hpp"
-#include <cctype>
+#include <cstdint>
 #include <fstream>
-#include <sstream>
 #include <vector>
 
 static std::string trim(const std::string &s)
@@ -195,8 +194,6 @@ bool parse_mod_config(const std::string &path, ModConfig &out)
 				out.description = parse_str(v);
 			else if (k == "content_path")
 				out.content_paths.push_back(parse_str(v));
-			else if (k == "enabled")
-				out.enabled = (trim(v) != "false");
 		}
 	}
 	flush_sp();

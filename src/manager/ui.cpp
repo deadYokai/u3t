@@ -5,6 +5,7 @@
 #include "gl_ctx.hpp"
 #include "theme.hpp"
 
+#include "loader_config.hpp"
 #include "logs.hpp"
 #include "mod_loader.hpp"
 #include "util.hpp"
@@ -20,7 +21,6 @@
 namespace
 {
 	int g_selected = -1;
-	std::vector<char> g_enabled;
 
 	std::string exe_name()
 	{
@@ -87,8 +87,8 @@ namespace
 		};
 
 		int enabled = 0;
-		for (size_t i = 0; i < mods.size(); ++i)
-			if (g_enabled[i])
+		for (const auto &m : mods)
+			if (m.cfg.enabled)
 				++enabled;
 
 		Cell cells[] = {
@@ -134,6 +134,61 @@ namespace
 		}
 	}
 
+	bool setting_row(const char *label, const char *hint, bool *value)
+	{
+		ImGui::PushID(label);
+
+		const float h = 16.0f;
+		float y = ImGui::GetCursorPosY();
+
+		bool changed = theme::toggle("##sw", value, h);
+
+		ImGui::SameLine(0, 12);
+		ImGui::SetCursorPosY(y + (h - ImGui::GetTextLineHeight()) * 0.5f);
+		ImGui::PushStyleColor(ImGuiCol_Text,
+		                      *value ? theme::col::hi : theme::col::txt);
+		ImGui::TextUnformatted(label);
+		ImGui::PopStyleColor();
+
+		if (hint && *hint)
+		{
+			ImGui::SameLine(0, 10);
+			ImGui::PushFont(theme::fonts.small_);
+			ImGui::PushStyleColor(ImGuiCol_Text, theme::col::dim);
+			ImGui::TextUnformatted(hint);
+			ImGui::PopStyleColor();
+			ImGui::PopFont();
+		}
+
+		ImGui::PopID();
+		return changed;
+	}
+
+	void draw_settings()
+	{
+		LoaderSettings &s = loader_config::settings();
+
+		if (setting_row("lua scripting", "embedded VM + mod scripts", &s.lua))
+			loader_config::mark_dirty();
+
+		if (setting_row("lua verbose", "log every script action",
+		                &s.lua_verbose))
+			loader_config::mark_dirty();
+
+		if (setting_row("open manager on launch", "no -cu3ml-manager required",
+		                &s.manager_at_start))
+			loader_config::mark_dirty();
+
+		ImGui::Dummy(ImVec2(0, 4));
+		ImGui::PushFont(theme::fonts.small_);
+		ImGui::PushStyleColor(ImGuiCol_Text, theme::col::dim);
+		std::string p = to_narrow(loader_config::path());
+		ImGui::TextWrapped("written to %s",
+		                   p.empty() ? "<unresolved>" : p.c_str());
+		ImGui::PopStyleColor();
+		ImGui::PopFont();
+	}
+
 	void draw_mod_row(int i, const LoadedMod &m)
 	{
 		ImGui::PushID(i);
@@ -148,7 +203,8 @@ namespace
 		ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
 		ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
 
-		if (ImGui::Selectable("##row", sel, 0, ImVec2(0, row_h)))
+		if (ImGui::Selectable("##row", sel, ImGuiSelectableFlags_AllowOverlap,
+		                      ImVec2(0, row_h)))
 			g_selected = i;
 
 		ImGui::PopStyleColor(3);
@@ -166,14 +222,27 @@ namespace
 			dl->AddRect(p0, p1, theme::accent(edge), 6.0f, 0, 1.0f);
 		}
 
+		const float sw_h = 16.0f;
+		ImVec2 resume = ImGui::GetCursorScreenPos();
+		ImGui::SetCursorScreenPos(
+		    ImVec2(p0.x + 14.0f, p0.y + (row_h - sw_h) * 0.5f));
+
+		bool on = m.cfg.enabled;
+		if (theme::toggle("##en", &on, sw_h))
+			mod_loader::set_enabled((size_t)i, on);
+		ImGui::Dummy(ImVec2(sw_h * 1.9f, sw_h));
+		ImGui::SetCursorScreenPos(resume);
+
 		float ty = p0.y + (row_h - ImGui::GetTextLineHeight()) * 0.5f;
+		const float text_x = p0.x + 14.0f + sw_h * 1.9f + 14.0f;
 
 		dl->AddText(theme::fonts.mono, theme::fonts.mono->LegacySize,
-		            ImVec2(p0.x + 14, ty), ImGui::GetColorU32(theme::col::dim),
+		            ImVec2(text_x, ty), ImGui::GetColorU32(theme::col::dim),
 		            idx);
 
-		std::string nm = m.cfg.name.empty() ? to_narrow(m.dir_w) : m.cfg.name;
-		dl->AddText(ImVec2(p0.x + 48, ty), ImGui::GetColorU32(theme::col::hi),
+		std::string nm = m.cfg.name.empty() ? m.key : m.cfg.name;
+		dl->AddText(ImVec2(text_x + 34.0f, ty),
+		            ImGui::GetColorU32(on ? theme::col::hi : theme::col::dim),
 		            nm.c_str());
 
 		std::string meta = m.cfg.version.empty() ? "" : ("v" + m.cfg.version);
@@ -217,6 +286,8 @@ namespace
 			ImGui::PopStyleColor();
 		};
 
+		kv("state", m.cfg.enabled ? "enabled" : "disabled");
+		kv("key", m.key);
 		kv("dir", to_narrow(m.dir_w));
 		kv("content paths", std::to_string(m.cfg.content_paths.size()));
 		kv("spawn patches", std::to_string(m.cfg.spawn_patches.size()));
@@ -238,9 +309,6 @@ namespace ui
 	Result run()
 	{
 		const std::vector<LoadedMod> &mods = mod_loader::loaded_mods();
-		g_enabled.assign(mods.size(), 1);
-		for (size_t i = 0; i < mods.size(); ++i)
-			g_enabled[i] = mods[i].cfg.enabled ? 1 : 0;
 
 		gl_ctx::Window win;
 		if (!gl_ctx::create(win, L"CU3ML Manager", 720, 1024))
@@ -327,6 +395,13 @@ namespace ui
 				ImGui::Separator();
 				ImGui::Dummy(ImVec2(0, 14));
 
+				theme::section_label("loader settings");
+				draw_settings();
+
+				ImGui::Dummy(ImVec2(0, 10));
+				ImGui::Separator();
+				ImGui::Dummy(ImVec2(0, 14));
+
 				theme::section_label("discovered mods");
 
 				float footer_h = ImGui::GetFrameHeightWithSpacing() + 20.0f;
@@ -342,7 +417,7 @@ namespace ui
 					ImGui::PushStyleColor(ImGuiCol_Text, theme::col::txt);
 					ImGui::TextWrapped(
 					    "No mods found. Drop mod folders containing a "
-					    "cu3ml.toml into the Mods directory next to the game.");
+					    "mod.toml into the Mods directory next to the game.");
 					ImGui::PopStyleColor();
 				}
 				for (int i = 0; i < (int)mods.size(); ++i)
@@ -407,6 +482,8 @@ namespace ui
 		ImGui_ImplWin32_Shutdown();
 		ImGui::DestroyContext();
 		gl_ctx::destroy(win);
+
+		loader_config::save_if_dirty();
 
 		log_info("manager_ui: exit (%s)",
 		         result == Result::Launch ? "launch" : "quit");

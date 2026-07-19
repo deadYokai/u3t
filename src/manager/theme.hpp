@@ -44,4 +44,5 @@ namespace theme
 
 	bool btn_ghost(const char *label, const ImVec2 &size = ImVec2(0, 0));
 
+	bool toggle(const char *id, bool *v, float height = 0.0f);
 }  // namespace theme

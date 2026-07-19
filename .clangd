@@ -4,6 +4,8 @@ CompileFlags:
     - -std=c++17
     - -O2
     - -I../src
+    - -I../third_party/imgui
+    - -I../third_party/imgui/backends
     - -I../third_party/zydis/include
     - -I../third_party/zydis/dependencies/zycore/include
     - -I../third_party/sol2/include

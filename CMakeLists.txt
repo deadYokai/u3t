@@ -9,10 +9,6 @@ if(NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
     )
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -60,14 +56,19 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-
 add_library(dinput8 SHARED ${IMGUI_SOURCES} ${LUA_SRC} ${WRAPPER_SOURCES})
+
+if(MINGW)
+    target_compile_options(dinput8 PRIVATE -std=c++17)
+elseif(MSVC)
+    target_compile_options(dinput8 PRIVATE /std:c++17)
+endif()
 
 target_include_directories(
     dinput8
     PRIVATE
         src
-		${IMGUI_DIR}
+        ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
         third_party/zydis/include
         third_party/zydis/dependencies/zycore/include
@@ -75,15 +76,25 @@ target_include_directories(
         third_party/lua
 )
 
-target_compile_definitions(dinput8 PRIVATE SOL_LUA_VERSION=504 IMGUI_IMPL_WIN32_DISABLE_GAMEPAD UNICODE _UNICODE)
+target_compile_definitions(
+    dinput8
+    PRIVATE
+        SOL_LUA_VERSION=504
+        IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+        UNICODE
+        _UNICODE
+)
 
-target_link_libraries(dinput8 PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32)
+target_link_libraries(
+    dinput8
+    PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32
+)
 
 set_target_properties(dinput8 PROPERTIES PREFIX "")
 if(MSVC)
     target_link_options(
         dinput8
-        PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/dinput8.def" ""
+        PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/dinput8.def"
     )
 else()
     target_link_options(

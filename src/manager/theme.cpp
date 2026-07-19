@@ -278,4 +278,41 @@ namespace theme
 		          ImGui::ColorConvertFloat4ToU32(hovered ? col::o2 : col::hi));
 		return pressed;
 	}
+
+	bool toggle(const char *id, bool *v, float height)
+	{
+		float h = height > 0.0f ? height : ImGui::GetFrameHeight() * 0.62f;
+		float w = h * 1.9f;
+		float r = h * 0.5f;
+
+		ImVec2 p0 = ImGui::GetCursorScreenPos();
+		bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h));
+		if (pressed && v)
+			*v = !*v;
+
+		bool on = v && *v;
+		bool hovered = ImGui::IsItemHovered();
+		bool held = ImGui::IsItemActive();
+
+		ImVec2 p1 = ImGui::GetItemRectMax();
+		ImDrawList *dl = ImGui::GetWindowDrawList();
+
+		if (on)
+			dl->AddRectFilled(
+			    p0, p1, accent(held ? 0.60f : (hovered ? 0.85f : 0.72f)), r);
+		else
+			dl->AddRectFilled(p0, p1,
+			                  ImGui::ColorConvertFloat4ToU32(col::bg_soft), r);
+
+		dl->AddRect(p0, p1, on ? accent(1.0f) : accent(hovered ? 0.45f : 0.18f),
+		            r, 0, 1.0f);
+
+		float knob = r - 2.5f;
+		float cx = on ? (p1.x - r) : (p0.x + r);
+		dl->AddCircleFilled(
+		    ImVec2(cx, p0.y + r), knob,
+		    on ? IM_COL32(0x1a, 0x09, 0x00, 0xff)
+		       : ImGui::ColorConvertFloat4ToU32(hovered ? col::txt : col::dim));
+		return pressed;
+	}
 }  // namespace theme

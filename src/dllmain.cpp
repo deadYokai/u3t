@@ -2,6 +2,7 @@
 #include "addr_cache.hpp"
 #include "anchor.hpp"
 #include "hook.hpp"
+#include "loader_config.hpp"
 #include "logs.hpp"
 #include "lua_host.hpp"
 #include "mod_loader.hpp"
@@ -156,9 +157,10 @@ bool cmdline_get_value(const wchar_t *name, std::wstring &out)
 static int __fastcall engine_loop_init(void *this_ptr)
 {
 
-	if (cmdline_has_switch(L"cu3ml-manager"))
+	if (cmdline_has_switch(L"cu3ml-manager") ||
+	    loader_config::settings().manager_at_start)
 	{
-		log_info("engine_loop_init: -cu3ml-manager present — halting boot");
+		log_info("engine_loop_init: manager requested — halting boot");
 
 		ui::Result r = ui::run();
 		if (r == ui::Result::Quit)
@@ -168,6 +170,7 @@ static int __fastcall engine_loop_init(void *this_ptr)
 			ExitProcess(0);
 		}
 
+		mod_loader::refresh();
 		log_info("engine_loop_init: manager requested launch — resuming");
 	}
 
@@ -208,7 +211,7 @@ static int __fastcall engine_loop_init(void *this_ptr)
 
 		log_info("engine_loop_init: discovering + installing "
 		         "overrides (Preload hook)");
-		override_loader::discover(mod_loader::loaded_mods());
+		override_loader::discover(mod_loader::enabled_mods());
 		override_loader::install_hooks();
 
 		log_info("engine_loop_init: committing hooks");
@@ -275,6 +278,7 @@ static DWORD WINAPI init_thread(LPVOID)
 {
 	logs::init();
 	addr_cache::init();
+	loader_config::load();
 	SYSTEMTIME st{};
 	GetLocalTime(&st);
 

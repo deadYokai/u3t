@@ -37,6 +37,7 @@ struct LoadedMod
 {
 	ModConfig cfg;
 	std::wstring dir_w;
+	std::string key;
 };
 
 bool parse_mod_config(const std::string &toml_path, ModConfig &out);

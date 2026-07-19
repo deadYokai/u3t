@@ -2,6 +2,7 @@
 #include "mod_loader.hpp"
 #include "config.hpp"
 #include "hook.hpp"
+#include "loader_config.hpp"
 #include "logs.hpp"
 #include "ue3_layout.hpp"
 #include "util.hpp"
@@ -26,6 +27,7 @@ namespace
 
 	std::vector<ReplaceEntry> g_replaces;
 	std::vector<LoadedMod> g_mods;
+	std::vector<LoadedMod> g_active;
 
 	static StaticLoadObjectFn g_orig_slo = nullptr;
 	static thread_local bool s_in_hook = false;
@@ -146,22 +148,21 @@ namespace
 
 			LoadedMod lm;
 			lm.dir_w = dir_w;
+			lm.key = to_narrow(fd.cFileName);
 			if (!parse_mod_config(to_narrow(toml_w), lm.cfg))
 			{
 				log_warn("mod_loader: skipping '%ls' (parse error)",
 				         fd.cFileName);
 				continue;
 			}
-			if (!lm.cfg.enabled)
-			{
-				log_info("mod_loader: '%ls' disabled", fd.cFileName);
-				continue;
-			}
 			if (lm.cfg.name.empty())
-				lm.cfg.name = to_narrow(fd.cFileName);
+				lm.cfg.name = lm.key;
+
+			lm.cfg.enabled = loader_config::mod_enabled(lm.key, lm.cfg.enabled);
+			loader_config::set_mod_enabled(lm.key, lm.cfg.enabled);
 
 			g_mods.push_back(std::move(lm));
-			log_info("mod_loader: found '%s'  v%s  by %s  deps=[%zu]",
+			log_info("mod_loader: found '%s'  v%s  by %s  deps=[%zu]  %s",
 			         g_mods.back().cfg.name.c_str(),
 			         g_mods.back().cfg.version.empty()
 			             ? "?"
@@ -169,15 +170,24 @@ namespace
 			         g_mods.back().cfg.author.empty()
 			             ? "unknown"
 			             : g_mods.back().cfg.author.c_str(),
-			         g_mods.back().cfg.dependencies.size());
+			         g_mods.back().cfg.dependencies.size(),
+			         g_mods.back().cfg.enabled ? "enabled" : "DISABLED");
 		} while (FindNextFileW(h, &fd));
 		FindClose(h);
 	}
 
 	static void build_tables()
 	{
+		g_replaces.clear();
+		g_active.clear();
+
 		for (const auto &lm : g_mods)
 		{
+			if (!lm.cfg.enabled)
+				continue;
+
+			g_active.push_back(lm);
+
 			for (const auto &rp : lm.cfg.replace_patches)
 			{
 				if (rp.original.empty() || rp.replacement.empty())
@@ -213,9 +223,39 @@ namespace mod_loader
 	{
 		discover_mods();
 		g_mods = topo_sort(std::move(g_mods));
+
+		std::vector<std::string> keys;
+		keys.reserve(g_mods.size());
+		for (const auto &lm : g_mods)
+			keys.push_back(lm.key);
+		loader_config::retain_mods(keys);
+		loader_config::save_if_dirty();
+
 		build_tables();
-		log_info("mod_loader: discovery done — %zu mod(s)  %zu replace(s)",
-		         g_mods.size(), g_replaces.size());
+		log_info("mod_loader: discovery done — %zu mod(s), %zu enabled, "
+		         "%zu replace(s)",
+		         g_mods.size(), g_active.size(), g_replaces.size());
+	}
+
+	void refresh()
+	{
+		build_tables();
+		log_info("mod_loader: refreshed — %zu of %zu mod(s) enabled, "
+		         "%zu replace(s)",
+		         g_active.size(), g_mods.size(), g_replaces.size());
+	}
+
+	void set_enabled(size_t index, bool on)
+	{
+		if (index >= g_mods.size())
+			return;
+		if (g_mods[index].cfg.enabled == on)
+			return;
+
+		g_mods[index].cfg.enabled = on;
+		loader_config::set_mod_enabled(g_mods[index].key, on);
+		log_info("mod_loader: '%s' %s", g_mods[index].cfg.name.c_str(),
+		         on ? "enabled" : "disabled");
 	}
 
 	void register_content()
@@ -235,7 +275,7 @@ namespace mod_loader
 			return;
 		}
 
-		for (const auto &lm : g_mods)
+		for (const auto &lm : g_active)
 			for (const auto &rel : lm.cfg.content_paths)
 				cache_content_path(cache, lm.dir_w + L"\\" + to_wide(rel));
 	}
@@ -272,4 +312,6 @@ namespace mod_loader
 	}
 
 	const std::vector<LoadedMod> &loaded_mods() { return g_mods; }
+
+	const std::vector<LoadedMod> &enabled_mods() { return g_active; }
 }  // namespace mod_loader
