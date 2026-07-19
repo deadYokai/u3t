@@ -41,7 +41,7 @@ if(MINGW)
     endforeach()
 endif()
 
-file(GLOB WRAPPER_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+file(GLOB WRAPPER_SOURCES CONFIGURE_DEPENDS src/*.cpp src/manager/*.cpp)
 
 file(GLOB LUA_SRC CONFIGURE_DEPENDS third_party/lua/l*.c)
 list(
@@ -50,21 +50,34 @@ list(
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/luac.c
 )
 
-add_library(dinput8 SHARED ${LUA_SRC} ${WRAPPER_SOURCES})
+set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+)
+
+
+add_library(dinput8 SHARED ${IMGUI_SOURCES} ${LUA_SRC} ${WRAPPER_SOURCES})
 
 target_include_directories(
     dinput8
     PRIVATE
         src
+		${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
         third_party/zydis/include
         third_party/zydis/dependencies/zycore/include
         third_party/sol2/include
         third_party/lua
 )
 
-target_compile_definitions(dinput8 PRIVATE SOL_LUA_VERSION=504)
+target_compile_definitions(dinput8 PRIVATE SOL_LUA_VERSION=504 IMGUI_IMPL_WIN32_DISABLE_GAMEPAD UNICODE _UNICODE)
 
-target_link_libraries(dinput8 PRIVATE Zydis psapi)
+target_link_libraries(dinput8 PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32)
 
 set_target_properties(dinput8 PROPERTIES PREFIX "")
 if(MSVC)

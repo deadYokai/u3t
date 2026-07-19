@@ -6,6 +6,7 @@
 #include "ue3_layout.hpp"
 #include "ue3_patch.hpp"
 #include "util.hpp"
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <psapi.h>
@@ -16,6 +17,26 @@
 #include <windows.h>
 
 static constexpr int kVT_MAX = 64;
+
+static std::vector<uint8_t> read_file(const std::wstring &path)
+{
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+	                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE)
+		return {};
+	LARGE_INTEGER sz{};
+	GetFileSizeEx(h, &sz);
+	if (sz.QuadPart <= 0 || sz.QuadPart > 64 * 1024 * 1024)
+	{
+		CloseHandle(h);
+		return {};
+	}
+	std::vector<uint8_t> buf(static_cast<size_t>(sz.QuadPart));
+	DWORD rd = 0;
+	ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &rd, nullptr);
+	CloseHandle(h);
+	return rd == buf.size() ? buf : std::vector<uint8_t>{};
+}
 
 static inline int uobj_serialize_slot()
 {
@@ -362,19 +383,19 @@ static void build_name_remap(override_loader::OverrideRecord &rec, void *linker)
 	{
 		auto *name_map = reinterpret_cast<UE3TArray *>(
 		    static_cast<uint8_t *>(linker) + ue3().l_NameMap);
-		UE3FName *existing = reinterpret_cast<UE3FName *>(name_map->Data);
+		FNameStack *existing = reinterpret_cast<FNameStack *>(name_map->Data);
 		int existing_num = name_map->Num;
 
-		std::vector<UE3FName> to_add;
+		std::vector<FNameStack> to_add;
 		rec.name_map_final.resize(rec.name_remap.size());
 
 		for (size_t i = 0; i < rec.name_remap.size(); ++i)
 		{
-			UE3FName fname{rec.name_remap[i], 0};
+			FNameStack fname{rec.name_remap[i], 0};
 			bool found = false;
 			for (int j = 0; j < existing_num; ++j)
 			{
-				if (memcmp(&existing[j], &fname, sizeof(UE3FName)) == 0)
+				if (memcmp(&existing[j], &fname, sizeof(FNameStack)) == 0)
 				{
 					rec.name_map_final[i] = j;
 					found = true;
@@ -518,8 +539,372 @@ static inline void orig_preload(void *linker, void *obj)
 		g_orig_Preload(linker_farchive(linker), obj);
 }
 
+struct NewExportSpec
+{
+	int32_t index = -1;
+	std::wstring path;       // full object path; also the override key
+	std::string class_name;  // informational only
+	int32_t class_index = 0;
+	int32_t outer_index = 0;
+	int32_t super_index = 0;
+	int32_t archetype_index = 0;
+	uint64_t object_flags = 0;
+	uint32_t export_flags = 0;
+	int32_t serial_size = 0;
+	std::wstring bin_name;
+};
+
+struct PendingExports
+{
+	std::wstring pkg;
+	std::vector<NewExportSpec> specs;
+	bool injected = false;
+	bool failed = false;
+
+	int32_t expected_base() const
+	{
+		return specs.empty() ? -1 : specs.front().index - 1;
+	}
+};
+
+static std::unordered_map<std::wstring, PendingExports> g_new_exports;
+static int g_preload_depth = 0;
+
+static std::wstring lower_w(std::wstring s)
+{
+	std::transform(s.begin(), s.end(), s.begin(),
+	               [](wchar_t c) { return (wchar_t)towlower(c); });
+	return s;
+}
+
+static bool parse_num(const std::string &s, int64_t &out)
+{
+	size_t i = 0;
+	bool neg = false;
+	if (i < s.size() && (s[i] == '-' || s[i] == '+'))
+		neg = (s[i++] == '-');
+	int base = 10;
+	if (s.size() - i > 2 && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X'))
+	{
+		base = 16;
+		i += 2;
+	}
+	if (i >= s.size())
+		return false;
+	uint64_t v = 0;
+	for (; i < s.size(); ++i)
+	{
+		const char c = s[i];
+		int d;
+		if (c >= '0' && c <= '9')
+			d = c - '0';
+		else if (c >= 'a' && c <= 'f')
+			d = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F')
+			d = c - 'A' + 10;
+		else
+			return false;
+		if (d >= base)
+			return false;
+		v = v * base + static_cast<uint64_t>(d);
+	}
+	out = neg ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+	return true;
+}
+
+static std::vector<std::string> split_tabs(const std::string &line)
+{
+	std::vector<std::string> out;
+	size_t start = 0;
+	for (;;)
+	{
+		const size_t t = line.find('\t', start);
+		if (t == std::string::npos)
+		{
+			out.push_back(line.substr(start));
+			return out;
+		}
+		out.push_back(line.substr(start, t - start));
+		start = t + 1;
+	}
+}
+
+static void parse_newexports(const std::wstring &file,
+                             const std::wstring &pkg_name)
+{
+	auto raw = read_file(file);
+	if (raw.empty())
+	{
+		log_warn("newexports: read failed '%ls'", file.c_str());
+		return;
+	}
+
+	PendingExports pe;
+	pe.pkg = pkg_name;
+
+	std::string text(raw.begin(), raw.end());
+	std::istringstream ss(text);
+	std::string line;
+	int lineno = 0;
+	while (std::getline(ss, line))
+	{
+		++lineno;
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (line.empty() || line[0] == '#')
+			continue;
+
+		auto col = split_tabs(line);
+		if (col.size() < 11)
+		{
+			log_warn("newexports: %ls:%d — expected 11 columns, got %zu",
+			         file.c_str(), lineno, col.size());
+			continue;
+		}
+
+		int64_t v[8] = {};
+		static const int kNumCols[8] = {0, 3, 4, 5, 6, 7, 8, 9};
+		bool ok = true;
+		for (int i = 0; i < 8 && ok; ++i)
+			ok = parse_num(col[kNumCols[i]], v[i]);
+		if (!ok)
+		{
+			log_warn("newexports: %ls:%d — malformed numeric field",
+			         file.c_str(), lineno);
+			continue;
+		}
+
+		NewExportSpec s;
+		s.index = static_cast<int32_t>(v[0]);
+		s.path = to_wide(col[1]);
+		s.class_name = col[2];
+		s.class_index = static_cast<int32_t>(v[1]);
+		s.outer_index = static_cast<int32_t>(v[2]);
+		s.super_index = static_cast<int32_t>(v[3]);
+		s.archetype_index = static_cast<int32_t>(v[4]);
+		s.object_flags = static_cast<uint64_t>(v[5]);
+		s.export_flags = static_cast<uint32_t>(v[6]);
+		s.serial_size = static_cast<int32_t>(v[7]);
+		s.bin_name = to_wide(col[10]);
+
+		if (s.path.empty() || s.index < 0)
+		{
+			log_warn("newexports: %ls:%d — bad index/path", file.c_str(),
+			         lineno);
+			continue;
+		}
+		pe.specs.push_back(std::move(s));
+	}
+
+	if (pe.specs.empty())
+		return;
+
+	std::sort(pe.specs.begin(), pe.specs.end(),
+	          [](const NewExportSpec &a, const NewExportSpec &b)
+	          { return a.index < b.index; });
+
+	log_info("newexports: '%ls' — %zu new export(s) queued", pkg_name.c_str(),
+	         pe.specs.size());
+	for (const auto &s : pe.specs)
+		log_info("newexports:   [%d] '%ls' class=%s cls_idx=%d outer=%d "
+		         "flags=0x%016llX ef=0x%08X size=%d",
+		         s.index, s.path.c_str(), s.class_name.c_str(), s.class_index,
+		         s.outer_index, (unsigned long long)s.object_flags,
+		         s.export_flags, s.serial_size);
+
+	g_new_exports[lower_w(pkg_name)] = std::move(pe);
+}
+
+static bool make_object_fname(const std::wstring &leaf, FNameStack &out)
+{
+	using FNameInitFn = void(UE3_THISCALL *)(void *, const wchar_t *, int32_t,
+	                                         int32_t, int32_t);
+	auto fni = reinterpret_cast<FNameInitFn>(ue3().FNameInit);
+	if (!fni)
+		return false;
+	out = FNameStack{};
+	fni(&out, leaf.c_str(), 0, 1, 1);
+	return true;
+}
+
+static bool exports_all_created(void *linker)
+{
+	TArrayView em = linker_exportmap(linker);
+	if (!em.data || em.num <= 0)
+		return false;
+	for (int i = 0; i < em.num; ++i)
+	{
+		void *e = em.data + static_cast<ptrdiff_t>(i) * ue3().exp_stride;
+		if (!safe_read(e, ue3().exp_stride) || !exp_object(e))
+			return false;
+	}
+	return true;
+}
+
+static void inject_new_exports(void *linker, PendingExports &pe)
+{
+	UE3Layout &L = ue3();
+	if (!L.ArrayRealloc || !L.FNameInit || !L.exp_stride)
+	{
+		log_err("newexports: '%ls' — ArrayRealloc/FNameInit unresolved, "
+		        "injection disabled",
+		        pe.pkg.c_str());
+		pe.failed = true;
+		return;
+	}
+
+	const int base = linker_exportmap(linker).num;
+	for (size_t i = 0; i < pe.specs.size(); ++i)
+	{
+		const int want_slot = base + static_cast<int>(i);
+		const int have_slot = pe.specs[i].index - 1;
+		if (have_slot != want_slot)
+		{
+			log_err("newexports: '%ls' wants slot %d (PACKAGE_INDEX %d) but "
+			        "would land at %d — refusing to inject, .bin references "
+			        "would be wrong",
+			        pe.specs[i].path.c_str(), have_slot, pe.specs[i].index,
+			        want_slot);
+			pe.failed = true;
+			return;
+		}
+	}
+
+	void *first = ue3_append_exports(linker, static_cast<int>(pe.specs.size()));
+	if (!first)
+	{
+		log_err("newexports: '%ls' — ExportMap append failed", pe.pkg.c_str());
+		pe.failed = true;
+		return;
+	}
+
+	for (size_t i = 0; i < pe.specs.size(); ++i)
+	{
+		const NewExportSpec &s = pe.specs[i];
+		uint8_t *e = static_cast<uint8_t *>(first) + i * L.exp_stride;
+
+		const size_t dot = s.path.rfind(L'.');
+		const std::wstring leaf =
+		    dot == std::wstring::npos ? s.path : s.path.substr(dot + 1);
+
+		FNameStack fn{};
+		if (!make_object_fname(leaf, fn))
+		{
+			log_err("newexports: FName init failed for '%ls'", leaf.c_str());
+			pe.failed = true;
+			return;
+		}
+		memcpy(e + L.e_ObjectName, &fn, sizeof(fn));
+
+		ue3raw::wr_i32(e, L.e_OuterIndex, s.outer_index);
+		ue3raw::wr_i32(e, L.e_ClassIndex, s.class_index);
+		ue3raw::wr_i32(e, L.e_SuperIndex, s.super_index);
+		ue3raw::wr_i32(e, L.e_ArchetypeIndex, s.archetype_index);
+		ue3raw::wr_u64(e, L.e_ObjectFlags, s.object_flags);
+		ue3raw::wr_i32(e, L.e_SerialSize, s.serial_size);
+		ue3raw::wr_i32(e, L.e_SerialOffset, 0);
+		ue3raw::wr_ptr(e, L.e_Object, nullptr);
+		ue3raw::wr_i32(e, L.e_iHashNext, -1);  // INDEX_NONE, not hashed
+
+		const uint32_t ef =
+		    s.export_flags & ~(EF_ForcedExport | EF_ScriptPatcherExport);
+		if (ef != s.export_flags)
+			log_warn("newexports: '%ls' export_flags 0x%08X -> 0x%08X "
+			         "(stripped EF_ForcedExport/EF_ScriptPatcherExport)",
+			         s.path.c_str(), s.export_flags, ef);
+		ue3raw::wr_u32(e, L.e_ExportFlags, ef);
+
+		if (!override_loader::find(s.path))
+			log_warn("newexports: no .bin registered for '%ls' — the object "
+			         "will be constructed but serialized from garbage",
+			         s.path.c_str());
+
+		log_info("newexports: injected [%d] '%ls' name=(%d,%d) outer=%d "
+		         "class=%d size=%d",
+		         base + (int)i, s.path.c_str(), fn.Index, fn.Number,
+		         s.outer_index, s.class_index, s.serial_size);
+	}
+
+	log_info("newexports: '%ls' ExportMap %d -> %d", pe.pkg.c_str(), base,
+	         linker_exportmap(linker).num);
+
+	pe.injected = true;
+}
+
+static PendingExports *pending_for_linker(void *linker)
+{
+	if (g_new_exports.empty() || !linker)
+		return nullptr;
+	void *root = linker_root(linker);
+	if (!root || !safe_read(root, ue3().sizeof_UObject))
+		return nullptr;
+	const std::wstring pkg = fname_str(uobj_name_index(root));
+	if (pkg.empty())
+		return nullptr;
+	auto it = g_new_exports.find(lower_w(pkg));
+	return it == g_new_exports.end() ? nullptr : &it->second;
+}
+
+static void try_inject_for_linker(void *linker, const char *why)
+{
+	PendingExports *pe = pending_for_linker(linker);
+	if (!pe || pe->injected || pe->failed)
+		return;
+
+	const int base = linker_exportmap(linker).num;
+	const int want = pe->expected_base();
+	if (base != want)
+	{
+		log_info("newexports: '%ls' deferred at %s — ExportMap.Num()=%d, "
+		         "expected %d",
+		         pe->pkg.c_str(), why, base, want);
+		return;
+	}
+
+	log_info("newexports: '%ls' injecting at %s (base=%d)", pe->pkg.c_str(),
+	         why, base);
+	inject_new_exports(linker, *pe);
+}
+
+#ifdef _WIN64
+#define UE3_CDECL
+#else
+#define UE3_CDECL __cdecl
+#endif
+
+using GetPackageLinkerFn = void *(UE3_CDECL *)(void *, const wchar_t *,
+                                               uint32_t, void *, void *);
+static GetPackageLinkerFn g_orig_GetPackageLinker = nullptr;
+
+static void *UE3_CDECL hooked_GetPackageLinker(void *InOuter,
+                                               const wchar_t *Filename,
+                                               uint32_t LoadFlags,
+                                               void *Sandbox,
+                                               void *CompatibleGuid)
+{
+	void *linker = g_orig_GetPackageLinker(InOuter, Filename, LoadFlags,
+	                                       Sandbox, CompatibleGuid);
+	if (linker && ue3().ok && !g_new_exports.empty())
+		try_inject_for_linker(linker, "GetPackageLinker");
+	return linker;
+}
+
+static void maybe_inject_new_exports(void *linker)
+{
+	if (g_preload_depth != 1 || !exports_all_created(linker))
+		return;
+	try_inject_for_linker(linker, "Preload/fallback");
+}
+
 static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
 {
+	struct DepthGuard
+	{
+		DepthGuard() { ++g_preload_depth; }
+
+		~DepthGuard() { --g_preload_depth; }
+	} depth_guard;
+
 	void *linker = farchive
 	                   ? static_cast<uint8_t *>(farchive) - ue3().l_FArchiveOff
 	                   : nullptr;
@@ -535,6 +920,8 @@ static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
 		orig_preload(linker, obj);
 		return;
 	}
+
+	maybe_inject_new_exports(linker);
 
 	if (!uobj_has_flag(obj, RF_NeedLoad))
 	{
@@ -596,26 +983,6 @@ static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
 static std::unordered_map<std::wstring, override_loader::OverrideRecord>
     g_overrides;
 
-static std::vector<uint8_t> read_file(const std::wstring &path)
-{
-	HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-	                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (h == INVALID_HANDLE_VALUE)
-		return {};
-	LARGE_INTEGER sz{};
-	GetFileSizeEx(h, &sz);
-	if (sz.QuadPart <= 0 || sz.QuadPart > 64 * 1024 * 1024)
-	{
-		CloseHandle(h);
-		return {};
-	}
-	std::vector<uint8_t> buf(static_cast<size_t>(sz.QuadPart));
-	DWORD rd = 0;
-	ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &rd, nullptr);
-	CloseHandle(h);
-	return rd == buf.size() ? buf : std::vector<uint8_t>{};
-}
-
 static std::vector<std::string> parse_namemap(const std::wstring &path)
 {
 	auto raw = read_file(path);
@@ -659,6 +1026,12 @@ static void scan_package_dir(const std::wstring &pkg_dir,
 	if (!names)
 		log_warn("override: no .namemap in '%ls' — FName remap disabled",
 		         pkg_dir.c_str());
+
+	{
+		std::wstring ne = pkg_dir + L"\\" + pkg_name + L".newexports";
+		if (GetFileAttributesW(ne.c_str()) != INVALID_FILE_ATTRIBUTES)
+			parse_newexports(ne, pkg_name);
+	}
 
 	WIN32_FIND_DATAW fd{};
 	HANDLE h = FindFirstFileW((pkg_dir + L"\\*.bin").c_str(), &fd);
@@ -729,13 +1102,17 @@ namespace override_loader
 	{
 		for (const auto &lm : mods)
 			scan_mod(lm);
-		log_info("override_loader: %zu override(s) discovered",
-		         g_overrides.size());
+		size_t nexp = 0;
+		for (const auto &kv : g_new_exports)
+			nexp += kv.second.specs.size();
+		log_info("override_loader: %zu override(s), %zu new export(s) "
+		         "discovered",
+		         g_overrides.size(), nexp);
 	}
 
 	void install_hooks()
 	{
-		if (g_overrides.empty())
+		if (g_overrides.empty() && g_new_exports.empty())
 		{
 			log_info("override_loader: no overrides — hook skipped");
 			return;
@@ -752,6 +1129,23 @@ namespace override_loader
 		void *addr = ue3().Preload;
 		hook::add(addr, reinterpret_cast<void *>(&hooked_Preload),
 		          reinterpret_cast<void **>(&g_orig_Preload));
+
+		if (!g_new_exports.empty())
+		{
+			if (ue3().GetPackageLinker)
+			{
+				hook::add(ue3().GetPackageLinker,
+				          reinterpret_cast<void *>(&hooked_GetPackageLinker),
+				          reinterpret_cast<void **>(&g_orig_GetPackageLinker));
+				log_info("newexports: GetPackageLinker hook at %p",
+				         ue3().GetPackageLinker);
+			}
+			else
+			{
+				log_warn("newexports: GetPackageLinker unresolved — falling "
+				         "back to the Preload gate, injection may be too late");
+			}
+		}
 
 		log_info("override_loader: Preload hook at %p  Serialize_slot=%d  "
 		         "GSerialObj=%p  (%zu override(s))",

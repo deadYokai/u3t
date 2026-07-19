@@ -1,11 +1,13 @@
-#include <string>
 #define WIN32_LEAN_AND_MEAN
 #include "anchor.hpp"
+#include "disp_extract.hpp"
 #include "logs.hpp"
+#include "util.hpp"
 
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 namespace anchor
 {
@@ -43,6 +45,46 @@ namespace anchor
 			p += in.length;
 		}
 		return p == interior;
+	}
+
+	static bool first_ret_pops(ZydisDecoder &dec, const uint8_t *entry,
+	                           const uint8_t *limit, uint64_t want_pop)
+	{
+		const uint8_t *q = entry;
+		while (q < limit)
+		{
+			ZydisDecodedInstruction in;
+			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(
+			        &dec, q, static_cast<ZyanUSize>(limit - q), &in, ops)))
+				return false;
+
+			if (in.mnemonic == ZYDIS_MNEMONIC_RET)
+			{
+				const uint64_t popped =
+				    (in.operand_count_visible >= 1 && is_imm(ops[0]))
+				        ? ops[0].imm.value.u
+				        : 0;
+				return popped == want_pop;
+			}
+			if (in.mnemonic == ZYDIS_MNEMONIC_JMP ||
+			    in.mnemonic == ZYDIS_MNEMONIC_INT3)
+				return false;
+
+			q += in.length;
+		}
+		return false;
+	}
+
+	static bool callee_argnum_matches(ZydisDecoder &dec, const uint8_t *entry,
+	                                  const uint8_t *limit, int argnum)
+	{
+		if (sizeof(void *) == 8)
+			return dx::x64_argnum_liveness(entry, limit) == argnum;
+
+		const uint64_t want_pop = static_cast<uint64_t>(argnum) *
+		                          static_cast<uint64_t>(sizeof(void *));
+		return first_ret_pops(dec, entry, limit, want_pop);
 	}
 
 	static IMAGE_NT_HEADERS *nt_of(uint8_t *base)
@@ -286,6 +328,82 @@ namespace anchor
 			}
 		}
 		return reinterpret_cast<uint8_t *>(entry) + 0x2000;
+	}
+
+	std::vector<void *> function_candidates_argnum(const void *begin,
+	                                               const void *end, int argnum)
+	{
+		std::vector<void *> out;
+		if (!begin || !end || begin >= end || argnum < 0)
+			return out;
+
+		ZydisDecoder dec;
+		ZydisDecoderInit(&dec,
+		                 sizeof(void *) == 8 ? ZYDIS_MACHINE_MODE_LONG_64
+		                                     : ZYDIS_MACHINE_MODE_LEGACY_32,
+		                 sizeof(void *) == 8 ? ZYDIS_STACK_WIDTH_64
+		                                     : ZYDIS_STACK_WIDTH_32);
+
+		const uint8_t *b = static_cast<const uint8_t *>(begin);
+		const uint8_t *e = static_cast<const uint8_t *>(end);
+
+		for (const uint8_t *p = b; p < e; ++p)
+		{
+			const bool at_start_of_range = (p == b);
+			if (!at_start_of_range && p[-1] != 0xCC && p[-1] != 0x90)
+				continue;
+			if ((reinterpret_cast<uintptr_t>(p) & 0xF) != 0)
+				continue;
+			if (*p == 0xCC || *p == 0x90)
+				continue;
+
+			if (callee_argnum_matches(dec, p, e, argnum))
+				out.push_back(const_cast<uint8_t *>(p));
+		}
+		return out;
+	}
+
+	std::vector<void *> function_calls_argnum(void *func_addr, int argnum)
+	{
+		std::vector<void *> out;
+		if (!func_addr || argnum < 0)
+			return out;
+
+		ModuleImage img = image_of(nullptr);
+		if (!img.ok)
+			return out;
+
+		uint8_t *entry = static_cast<uint8_t *>(func_addr);
+		uint8_t *end = function_end(img, entry);
+		if (!end)
+			return out;
+
+		ZydisDecoder dec;
+		ZydisDecoderInit(&dec,
+		                 img.x64 ? ZYDIS_MACHINE_MODE_LONG_64
+		                         : ZYDIS_MACHINE_MODE_LEGACY_32,
+		                 img.x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
+
+		uint8_t *text_end = img.text + img.text_size;
+
+		uint8_t *p = entry;
+		for (; p + 5 <= end; ++p)
+		{
+			if (p[0] != 0xE8)
+				continue;
+			int32_t rel;
+			memcpy(&rel, p + 1, 4);
+			uint8_t *tgt = p + 5 + rel;
+			if (tgt < img.text || tgt >= text_end)
+				continue;
+			if (callee_argnum_matches(dec, tgt, text_end, argnum))
+				out.push_back(tgt);
+			p += 4;
+		}
+
+		std::sort(out.begin(), out.end());
+		out.erase(std::unique(out.begin(), out.end()), out.end());
+		return out;
 	}
 
 	std::vector<void *> functions_referencing_wstr(const ModuleImage &img,

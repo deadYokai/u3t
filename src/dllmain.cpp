@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#include "addr_cache.hpp"
 #include "anchor.hpp"
 #include "hook.hpp"
 #include "logs.hpp"
@@ -8,6 +9,9 @@
 #include "ue3_api.hpp"
 #include "ue3_layout.hpp"
 #include "util.hpp"
+
+#include "manager/ui.hpp"
+
 #include <unknwn.h>
 #include <windows.h>
 
@@ -78,8 +82,95 @@ static void init_dinput8()
 	}
 }
 
+std::wstring lower(std::wstring s)
+{
+	for (auto &c : s)
+		c = (wchar_t)towlower(c);
+	return s;
+}
+
+const std::vector<std::wstring> &tokens()
+{
+	static std::vector<std::wstring> toks;
+	static bool done = false;
+	if (done)
+		return toks;
+	done = true;
+
+	const wchar_t *raw = GetCommandLineW();
+	if (!raw)
+		return toks;
+
+	std::wstring cur;
+	bool in_quote = false;
+	for (const wchar_t *p = raw; *p; ++p)
+	{
+		if (*p == L'"')
+		{
+			in_quote = !in_quote;
+			continue;
+		}
+		if (!in_quote && (*p == L' ' || *p == L'\t'))
+		{
+			if (!cur.empty())
+				toks.push_back(cur);
+			cur.clear();
+			continue;
+		}
+		cur += *p;
+	}
+	if (!cur.empty())
+		toks.push_back(cur);
+	return toks;
+}
+
+bool cmdline_has_switch(const wchar_t *name)
+{
+	std::wstring want = lower(name);
+	for (const auto &t : tokens())
+	{
+		if (t.size() < 2 || (t[0] != L'-' && t[0] != L'/'))
+			continue;
+		if (lower(t.substr(1)) == want)
+			return true;
+	}
+	return false;
+}
+
+bool cmdline_get_value(const wchar_t *name, std::wstring &out)
+{
+	std::wstring want = lower(name) + L"=";
+	for (const auto &t : tokens())
+	{
+		if (t.size() < 2 || (t[0] != L'-' && t[0] != L'/'))
+			continue;
+		std::wstring body = t.substr(1);
+		if (lower(body).rfind(want, 0) != 0)
+			continue;
+		out = body.substr(want.size());
+		return !out.empty();
+	}
+	return false;
+}
+
 static int __fastcall engine_loop_init(void *this_ptr)
 {
+
+	if (cmdline_has_switch(L"cu3ml-manager"))
+	{
+		log_info("engine_loop_init: -cu3ml-manager present — halting boot");
+
+		ui::Result r = ui::run();
+		if (r == ui::Result::Quit)
+		{
+			log_info("engine_loop_init: manager requested exit");
+			hook::remove_all();
+			ExitProcess(0);
+		}
+
+		log_info("engine_loop_init: manager requested launch — resuming");
+	}
+
 	log_info("engine_loop_init: GEngineLoop::Init reached — resolving "
 	         "UE3 layout");
 
@@ -133,24 +224,42 @@ static int __fastcall engine_loop_init(void *this_ptr)
 
 static bool install_engine_loop_init_hook()
 {
-	anchor::ModuleImage img = anchor::image_of(nullptr);
-	if (!img.ok)
-	{
-		log_err("install_engine_loop_init_hook: image_of failed");
-		return false;
-	}
 
-	auto hits = anchor::functions_referencing_wstr(img, L"NoTextureStreaming");
-	if (hits.size() != 1)
-	{
-		log_err("install_engine_loop_init_hook: anchor ambiguous/missing "
-		        "(%zu hits) — check this build",
-		        hits.size());
-		return false;
-	}
+	void *target = nullptr;
 
-	void *target = hits.front();
-	log_info("install_engine_loop_init_hook: GEngineLoop::Init = %p", target);
+	if (addr_cache::get_ptr("engine.EngineLoopInit", target) && target)
+	{
+		log_info("install_engine_loop_init_hook: GEngineLoop::Init = %p "
+		         "(from cu3ml.addrlist)",
+		         target);
+	}
+	else
+	{
+		anchor::ModuleImage img = anchor::image_of(nullptr);
+		if (!img.ok)
+		{
+			log_err("install_engine_loop_init_hook: image_of failed");
+			return false;
+		}
+
+		auto hits =
+		    anchor::functions_referencing_wstr(img, L"NoTextureStreaming");
+		if (hits.size() != 1)
+		{
+			log_err("install_engine_loop_init_hook: anchor ambiguous/missing "
+			        "(%zu hits) — check this build",
+			        hits.size());
+			return false;
+		}
+
+		target = hits.front();
+		log_info("install_engine_loop_init_hook: GEngineLoop::Init = %p "
+		         "(scanned)",
+		         target);
+
+		addr_cache::put_ptr("engine.EngineLoopInit", target);
+		addr_cache::save();
+	}
 
 	hook::add(target, reinterpret_cast<void *>(&engine_loop_init),
 	          reinterpret_cast<void **>(&g_orig_engine_loop_init));
@@ -164,7 +273,8 @@ static bool install_engine_loop_init_hook()
 
 static DWORD WINAPI init_thread(LPVOID)
 {
-	logs::init(get_exe_dir());
+	logs::init();
+	addr_cache::init();
 	SYSTEMTIME st{};
 	GetLocalTime(&st);
 

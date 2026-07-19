@@ -29,8 +29,14 @@ namespace anchor
 
 	void *function_entry(const ModuleImage &img, const void *interior);
 
+	std::vector<void *> function_candidates_argnum(const void *begin,
+	                                               const void *end, int argnum);
+
+	std::vector<void *> function_calls_argnum(void *func_addr, int argnum);
+
 	std::vector<void *> functions_referencing_wstr(const ModuleImage &img,
 	                                               const wchar_t *needle);
+
 	std::vector<void *> functions_referencing_cstr(const ModuleImage &img,
 	                                               const char *needle);
 

@@ -4,6 +4,8 @@
 
 #include <sol/sol.hpp>
 
+#include "addr_cache.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -103,6 +105,9 @@ namespace
 	void *g_remove_key = nullptr;
 	void *g_add = nullptr;
 
+	void *g_gconfig = nullptr;
+	std::unordered_map<std::wstring, std::wstring> g_file_by_pkg;
+
 	std::wstring loc_key(const wchar_t *pkg, const wchar_t *sec,
 	                     const wchar_t *key)
 	{
@@ -200,6 +205,21 @@ namespace
 	using RemoveKeyFNFn = int(UE3_THISCALL *)(void *Sec, FNameStack Key);
 	using AddFNFn = int *(UE3_THISCALL *)(void *Sec, int *outIdx,
 	                                      PairInitFN *kv, int *outFlag);
+
+	using SetStringFn = void(UE3_THISCALL *)(void *self, const wchar_t *Section,
+	                                         const wchar_t *Key,
+	                                         const wchar_t *Value,
+	                                         const wchar_t *Filename);
+
+	using SetArrayFn = void(UE3_THISCALL *)(void *self, const wchar_t *Section,
+	                                        const wchar_t *Key,
+	                                        const UE3TArray *Value,
+	                                        const wchar_t *Filename);
+
+	using GetArrayFn = int(UE3_THISCALL *)(void *self, const wchar_t *Section,
+	                                       const wchar_t *Key,
+	                                       UE3TArray *Result,
+	                                       const wchar_t *Filename);
 
 	void *g_key_ctor = nullptr;
 	bool g_fname_keyed = false;
@@ -408,70 +428,187 @@ namespace
 	                                          int Const,
 	                                          const wchar_t *Filename);
 
+	struct SecOp
+	{
+		std::wstring pkg;
+		std::wstring file;
+		std::wstring section;
+		std::wstring key;
+		std::wstring value;
+		bool add = true;
+		bool remove = true;
+	};
+
+	std::vector<SecOp> g_sec_pending;
+	std::vector<SecOp> g_sec_applied;
+
+	bool sec_ops_ready()
+	{
+		return g_remove_key && g_add && (!g_fname_keyed || g_key_ctor);
+	}
+
+	void *cfg_self()
+	{
+		if (!g_gconfig && ue3().GConfig)
+			g_gconfig = *ue3().GConfig;
+		return g_gconfig;
+	}
+
+	const std::wstring *cfg_file_for(const SecOp &op)
+	{
+		if (!op.file.empty())
+			return &op.file;
+		auto it = g_file_by_pkg.find(lower(op.pkg));
+		return it == g_file_by_pkg.end() ? nullptr : &it->second;
+	}
+
+	void *cfg_section(const wchar_t *Section, const wchar_t *Filename,
+	                  bool create)
+	{
+		void *self = cfg_self();
+		if (!self || !g_orig_get_section || !Section || !Filename)
+			return nullptr;
+		auto fn = reinterpret_cast<GetSectionFn>(g_orig_get_section);
+		void *Sec = fn(self, Section, 0, 1, Filename);
+		if (!Sec && create)
+			Sec = fn(self, Section, 1, 0, Filename);
+		return Sec;
+	}
+
+	bool ieq(const std::wstring &a, const wchar_t *b)
+	{
+		return b && lower(a) == lower(std::wstring(b));
+	}
+
+	bool matches_file(const SecOp &op, const wchar_t *Filename)
+	{
+		if (!Filename)
+			return false;
+		if (!op.file.empty())
+			return ieq(op.file, Filename);
+		if (op.pkg.empty())
+			return false;
+		return lower(op.pkg) == lower(package_from_filename(Filename));
+	}
+
+	void sec_apply_to(void *Sec, const SecOp &op)
+	{
+		if (!Sec || !sec_ops_ready())
+			return;
+
+		EngFString ValStr{};
+		if (op.add)
+			build_eng_fstring(&ValStr, op.value);
+
+		if (g_fname_keyed)
+		{
+			FNameStack fn{};
+			reinterpret_cast<FNameInitFn>(g_key_ctor)(&fn, op.key.c_str(), 0, 1,
+			                                          1);
+			if (op.remove)
+				reinterpret_cast<RemoveKeyFNFn>(g_remove_key)(Sec, fn);
+			if (op.add)
+			{
+				int idx = 0;
+				PairInitFN kv{fn, &ValStr};
+				reinterpret_cast<AddFNFn>(g_add)(Sec, &idx, &kv, nullptr);
+			}
+		}
+		else
+		{
+			EngFString KeyStr{};
+			build_eng_fstring(&KeyStr, op.key);
+			if (op.remove)
+				reinterpret_cast<RemoveKeyFn>(g_remove_key)(Sec, &KeyStr);
+			if (op.add)
+				reinterpret_cast<AddFn>(g_add)(Sec, &KeyStr, &ValStr);
+		}
+	}
+
+	bool sec_apply(const SecOp &op)
+	{
+		if (!sec_ops_ready())
+			return false;
+		const std::wstring *file = cfg_file_for(op);
+		if (!file)
+			return false;
+
+		void *Sec = cfg_section(op.section.c_str(), file->c_str(), op.add);
+		if (!Sec)
+			return false;
+
+		sec_apply_to(Sec, op);
+		log_info("lua: section - %ls[%ls].%ls add=%d remove=%d applied",
+		         file->c_str(), op.section.c_str(), op.key.c_str(), (int)op.add,
+		         (int)op.remove);
+		return true;
+	}
+
+	void sec_flush_pending()
+	{
+		if (g_sec_pending.empty())
+			return;
+		std::vector<SecOp> keep;
+		for (auto &op : g_sec_pending)
+		{
+			if (sec_apply(op))
+				g_sec_applied.push_back(op);
+			else
+				keep.push_back(std::move(op));
+		}
+		g_sec_pending.swap(keep);
+	}
+
 	void *__fastcall get_section_detour(void *self, const wchar_t *Section,
 	                                    int Force, int Const,
 	                                    const wchar_t *Filename)
 	{
-		std::wstring pkg = package_from_filename(Filename).c_str();
+		if (!g_gconfig && self)
+			g_gconfig = self;
+
 		void *Sec = reinterpret_cast<GetSectionFn>(g_orig_get_section)(
 		    self, Section, Force, Const, Filename);
-		if (Sec && Section && Filename && !pkg.empty())
-		{
-			std::wstring prefix = loc_prefix(pkg.c_str(), Section);
 
-			std::lock_guard<std::mutex> lk(g_loc_mtx);
+		std::wstring pkg = package_from_filename(Filename);
+		std::lock_guard<std::mutex> lk(g_loc_mtx);
+
+		if (!pkg.empty() && Filename)
+			g_file_by_pkg[lower(pkg)] = Filename;
+
+		if (Sec && Section && Filename && !pkg.empty() && sec_ops_ready())
+		{
+			const std::wstring prefix = loc_prefix(pkg.c_str(), Section);
 
 			for (const auto &[k, v] : g_loc_overrides)
 			{
-				if (k.compare(0, prefix.size(), prefix) == 0)
-				{
-					if (g_remove_key && g_add && (!g_fname_keyed || g_key_ctor))
-					{
-						size_t key_start = prefix.size();
-						size_t key_end = k.find(L'\x01', key_start);
+				if (k.size() < prefix.size() ||
+				    k.compare(0, prefix.size(), prefix) != 0)
+					continue;
 
-						if (key_end == std::wstring::npos)
-							continue;
+				const size_t key_end = k.find(L'\x01', prefix.size());
+				if (key_end == std::wstring::npos)
+					continue;
 
-						std::wstring key =
-						    k.substr(key_start, key_end - key_start);
-
-						EngFString ValStr{};
-						build_eng_fstring(&ValStr, std::wstring(v.c_str()));
-
-						if (g_fname_keyed)
-						{
-							FNameStack fn{};
-							reinterpret_cast<FNameInitFn>(g_key_ctor)(
-							    &fn, key.c_str(), 0, 1, 1);
-
-							reinterpret_cast<RemoveKeyFNFn>(g_remove_key)(Sec,
-							                                              fn);
-
-							int idx = 0;
-							PairInitFN kv{fn, &ValStr};
-							reinterpret_cast<AddFNFn>(g_add)(Sec, &idx, &kv,
-							                                 nullptr);
-						}
-						else
-						{
-							EngFString KeyStr{};
-							build_eng_fstring(&KeyStr, key);
-							reinterpret_cast<RemoveKeyFn>(g_remove_key)(
-							    Sec, &KeyStr);
-							reinterpret_cast<AddFn>(g_add)(Sec, &KeyStr,
-							                               &ValStr);
-						}
-					}
-					else
-					{
-						log_warn(
-						    "lua: localize - Section functions not resolved, "
-						    "skipping patch");
-					}
-				}
+				SecOp op;
+				op.key = k.substr(prefix.size(), key_end - prefix.size());
+				op.value = v;
+				op.add = true;
+				op.remove = true;
+				sec_apply_to(Sec, op);
 			}
+
+			for (const SecOp &op : g_sec_applied)
+				if (op.add && op.remove && ieq(op.section, Section) &&
+				    matches_file(op, Filename))
+					sec_apply_to(Sec, op);
 		}
+		else if (Sec && !sec_ops_ready())
+		{
+			log_warn("lua: localize - Section functions not resolved, "
+			         "skipping patch");
+		}
+
+		sec_flush_pending();
 
 		return Sec;
 	}
@@ -507,72 +644,167 @@ namespace
 		    ret, Section, Key, Package, Lang, bOpt);
 	}
 
-	bool ensure_localize_hook()
+	using FindFileFn = void *(UE3_THISCALL *)(void *, const wchar_t *, int);
+	static void *g_orig_find_file = nullptr;
+
+	void *__fastcall find_file_detour(void *self,
+	                                  UE3_EDX const wchar_t *Filename,
+	                                  int CreateIfNotFound)
+	{
+		void *File = reinterpret_cast<FindFileFn>(g_orig_find_file)(
+		    self, Filename, CreateIfNotFound);
+
+		if (!g_gconfig && self)
+			g_gconfig = self;
+		static thread_local bool in_flush = false;
+		if (in_flush || !File || !Filename)
+			return File;
+
+		std::wstring pkg = package_from_filename(Filename);
+		if (pkg.empty())
+			return File;
+
+		in_flush = true;
+		{
+			std::lock_guard<std::mutex> lk(g_loc_mtx);
+			g_file_by_pkg[lower(pkg)] = Filename;
+			sec_flush_pending();
+		}
+		in_flush = false;
+		return File;
+	}
+
+	static void resolve_lua_addrs(LuaAddrLayout &L)
+	{
+		static const wchar_t *loc_kAnchors[] = {L"?%s?%s.%s.%s?",
+		                                        L"<?%s?%s.%s.%s?>"};
+		L.Localize = ue3_api::resolve_wstr_any(loc_kAnchors, 2, "Localize");
+		if (!L.Localize)
+		{
+			log_warn("lua: Localize not resolved");
+			return;
+		}
+
+		static const wchar_t *sec_kAnchors[] = {L"UnrealEd.EditorEngine",
+		                                        L"Editor.EditorEngine"};
+		L.LoadAllClasses =
+		    ue3_api::resolve_wstr_any(sec_kAnchors, 2, "LoadAllClasses");
+		if (!L.LoadAllClasses)
+		{
+			log_warn("lua: LoadAllClasses anchor not found");
+			return;
+		}
+
+		anchor::ModuleImage img = anchor::image_of(nullptr);
+		if (!img.ok)
+		{
+			log_warn("lua: module image unavailable");
+			return;
+		}
+
+		const uint8_t *combine = nullptr;
+		if (resolve_section_ops(img, &L.SectionAdd, &L.SectionRemoveKey,
+		                        &combine, &L.KeyCtor, &L.fname_keyed))
+		{
+			L.Combine = (void *)combine;
+			log_info("lua: Combine=%p Add=%p RemoveKey=%p", L.Combine,
+			         L.SectionAdd, L.SectionRemoveKey);
+		}
+		else
+		{
+			L.SectionAdd = L.SectionRemoveKey = L.KeyCtor = nullptr;
+			L.Combine = nullptr;
+			L.fname_keyed = false;
+			log_warn("lua: Combine/section ops unresolved");
+		}
+
+		L.GetSectionPrivate = anchor::nth_call_target(img, L.LoadAllClasses, 0);
+		if (!L.GetSectionPrivate)
+		{
+			log_warn("lua: GetSectionPrivate not found via "
+			         "nth_call_target");
+			return;
+		}
+		log_info("lua: GetSectionPrivate resolved = %p", L.GetSectionPrivate);
+
+		void *find = anchor::nth_call_target(img, L.GetSectionPrivate, 0);
+		if (!find || find == L.GetSectionPrivate)
+		{
+			log_warn("lua: FConfigCacheIni::Find not found "
+			         "(LoadAllClasses=%p GetSectionPrivate=%p)",
+			         L.LoadAllClasses, L.GetSectionPrivate);
+			return;
+		}
+		L.FindFile = find;
+		log_info("lua: Find=%p GetSectionPrivate=%p", L.FindFile,
+		         L.GetSectionPrivate);
+	}
+
+	bool ensure_lua_hooks()
 	{
 		static bool tried = false, ok = false;
 		if (tried)
 			return ok;
 		tried = true;
-		static const wchar_t *loc_kAnchors[] = {L"?%s?%s.%s.%s?",
-		                                        L"<?%s?%s.%s.%s?>"};
-		static void *loc_addr =
-		    ue3_api::resolve_wstr_any(loc_kAnchors, 2, "Localize");
-		if (!loc_addr)
-		{
-			log_warn("lua: localize - Localize not resolved");
-			return false;
-		}
+
 		if (!ue3().ArrayRealloc)
 		{
-			log_warn("lua: localize - ArrayRealloc unresolved");
+			log_warn("lua: ArrayRealloc unresolved");
 			return false;
 		}
 
-		static const wchar_t *sec_kAnchors[] = {L"UnrealEd.EditorEngine",
-		                                        L"Editor.EditorEngine"};
-		static void *loadallclasses_addr =
-		    ue3_api::resolve_wstr_any(sec_kAnchors, 2, "LoadAllClasses");
+		LuaAddrLayout L;
+		const bool from_cache = addr_cache::load_lua(L);
+		if (!from_cache)
+			resolve_lua_addrs(L);
 
-		void *get_section_addr = nullptr;
-		if (loadallclasses_addr)
+		if (!L.Localize)
+			return false;
+
+		g_add = L.SectionAdd;
+		g_remove_key = L.SectionRemoveKey;
+		g_key_ctor = L.KeyCtor;
+		g_fname_keyed = L.fname_keyed;
+
+		if (L.FindFile)
+			hook::add(L.FindFile, (void *)&find_file_detour, &g_orig_find_file);
+		if (L.GetSectionPrivate)
+			hook::add(L.GetSectionPrivate, (void *)&get_section_detour,
+			          &g_orig_get_section);
+		hook::add(L.Localize, (void *)&localize_detour, &g_orig_localize);
+		hook::install_all();
+
+		ok = (g_orig_localize != nullptr);
+		if (!ok)
 		{
-			anchor::ModuleImage img = anchor::image_of(nullptr);
-			if (img.ok)
-			{
-
-				const uint8_t *combine = nullptr;
-				if (resolve_section_ops(img, &g_add, &g_remove_key, &combine,
-				                        &g_key_ctor, &g_fname_keyed))
-				{
-					log_info("lua: localize - Combine=%p Add=%p RemoveKey=%p",
-					         combine, g_add, g_remove_key);
-				}
-				else
-				{
-					g_add = g_remove_key = g_key_ctor = nullptr;
-					g_fname_keyed = false;
-					log_warn("lua: localize - Combine/section ops unresolved");
-				}
-
-				get_section_addr =
-				    anchor::nth_call_target(img, loadallclasses_addr, 0);
-			}
-			if (get_section_addr)
-				log_info("lua: localize - GetSectionPrivate resolved = %p",
-				         get_section_addr);
-			else
-				log_warn("lua: localize - GetSectionPrivate not found via "
-				         "nth_call_target");
+			log_err("lua: hook install failed");
+			if (from_cache)
+				addr_cache::invalidate("lua hooks failed to install");
+			return false;
 		}
 
-		hook::add(loc_addr, (void *)&localize_detour, &g_orig_localize);
-		hook::add(get_section_addr, (void *)&get_section_detour,
-		          &g_orig_get_section);
-		hook::install_all();
-		ok = (g_orig_localize != nullptr);
-		log_info(ok ? "lua: Localize hook installed (localize2)"
-		            : "lua: localize2 - hook install failed");
+		log_info("lua: lua hook installed%s", from_cache ? " [cached]" : "");
+
+		L.ok = L.Localize && L.GetSectionPrivate && L.FindFile &&
+		       L.SectionAdd && L.SectionRemoveKey &&
+		       (!L.fname_keyed || L.KeyCtor);
+		if (!from_cache && L.ok) {
+			addr_cache::store_lua(L);
+			addr_cache::save();
+		}
+
 		return ok;
+	}
+
+	bool sec_submit(SecOp op)
+	{
+		if (!ensure_lua_hooks())
+			return false;
+		std::lock_guard<std::mutex> lk(g_loc_mtx);
+		if (sec_apply(op))
+			return true;
+		g_sec_pending.push_back(std::move(op));
+		return true;
 	}
 
 	void bind_ue3(sol::state &lua)
@@ -702,8 +934,7 @@ namespace
 			    std::wstring w = to_wide(s);
 			    using Fn = void(UE3_THISCALL *)(void *, const wchar_t *, int,
 			                                    int, int);
-			    reinterpret_cast<Fn>(init)(&out, w.c_str(), 0, /*FNAME_Add*/ 1,
-			                               /*bSplitName*/ 1);
+			    reinterpret_cast<Fn>(init)(&out, w.c_str(), 0, 1, 1);
 			    return lua.create_table_with("index", out.Index, "number",
 			                                 out.Number);
 		    });
@@ -718,21 +949,6 @@ namespace
 			                 if (L.name.is_unicode(e))
 				                 return to_narrow(L.name.uni(e));
 			                 return std::string(L.name.ansi(e));
-		                 });
-
-		tbl.set_function("localize",
-		                 [](const std::string &section, const std::string &key,
-		                    const std::string &package,
-		                    const std::string &new_string) -> bool
-		                 {
-			                 if (!ensure_localize_hook())
-				                 return false;
-			                 std::wstring wk = loc_key(to_wide(package).c_str(),
-			                                           to_wide(section).c_str(),
-			                                           to_wide(key).c_str());
-			                 std::lock_guard<std::mutex> lk(g_loc_mtx);
-			                 g_loc_overrides[wk] = to_wide(new_string);
-			                 return true;
 		                 });
 
 		tbl.set_function(
@@ -773,6 +989,74 @@ namespace
 			    int handled = exec_fn(w.c_str(), ar.device());
 			    return {ar.take(), handled != 0};
 		    });
+
+		{
+			sol::table sec_tbl = tbl["section"].get_or_create<sol::table>();
+
+			auto make_op =
+			    [](const std::string &section, const std::string &key,
+			       const std::string &package, const std::string &value,
+			       sol::optional<std::string> file, bool add, bool remove)
+			{
+				SecOp op;
+				op.pkg = to_wide(package);
+				op.file = file ? to_wide(*file) : std::wstring{};
+				op.section = to_wide(section);
+				op.key = to_wide(key);
+				op.value = to_wide(value);
+				op.add = add;
+				op.remove = remove;
+				return op;
+			};
+
+			sec_tbl.set_function(
+			    "localize",
+			    [](const std::string &section, const std::string &key,
+			       const std::string &package,
+			       const std::string &new_string) -> bool
+			    {
+				    if (!ensure_lua_hooks())
+					    return false;
+				    std::wstring wk =
+				        loc_key(to_wide(package).c_str(),
+				                to_wide(section).c_str(), to_wide(key).c_str());
+				    std::lock_guard<std::mutex> lk(g_loc_mtx);
+				    g_loc_overrides[wk] = to_wide(new_string);
+				    return true;
+			    });
+
+			sec_tbl.set_function(
+			    "set",
+			    [make_op](const std::string &section, const std::string &key,
+			              const std::string &package,
+			              const std::string &new_string,
+			              sol::optional<std::string> file)
+			    {
+				    return sec_submit(make_op(section, key, package, new_string,
+				                              file, true, true));
+			    });
+
+			sec_tbl.set_function(
+			    "add",
+			    [make_op](const std::string &section, const std::string &key,
+			              const std::string &package,
+			              const std::string &new_string,
+			              sol::optional<std::string> file)
+			    {
+				    return sec_submit(make_op(section, key, package, new_string,
+				                              file, true, false));
+			    });
+
+			sec_tbl.set_function(
+			    "remove",
+			    [make_op](const std::string &section, const std::string &key,
+			              const std::string &package,
+			              sol::optional<std::string> file)
+			    {
+				    return sec_submit(
+				        make_op(section, key, package, "", file, false, true));
+			    });
+		}
 
 		{
 			sol::table input = tbl["input"].get_or_create<sol::table>();
@@ -837,8 +1121,19 @@ namespace
 		for (const auto &lm : mod_loader::loaded_mods())
 		{
 			std::wstring path = lm.dir_w + L"\\main.lua";
+
 			if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
 			{
+				std::string lua_dir = to_narrow(lm.dir_w);
+
+				std::replace(lua_dir.begin(), lua_dir.end(), '\\', '/');
+
+				sol::table package = (*g_lua)["package"];
+				std::string old_path = package["path"];
+
+				package["path"] = old_path + ";" + lua_dir + "/?.lua;" +
+				                  lua_dir + "/?/init.lua";
+
 				log_info("lua: running mod script %ls", path.c_str());
 				lua_host::run_file(path);
 			}
@@ -908,6 +1203,7 @@ namespace lua_host
 			                      sol::lib::string, sol::lib::table,
 			                      sol::lib::math, sol::lib::os, sol::lib::io,
 			                      sol::lib::coroutine);
+
 			bind_ue3(*g_lua);
 			log_info("lua: VM ready (sol %d.%d.%d, Lua %s.%s.%s)",
 			         SOL_VERSION_MAJOR, SOL_VERSION_MINOR, SOL_VERSION_PATCH,

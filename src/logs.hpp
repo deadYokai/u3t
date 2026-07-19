@@ -5,7 +5,7 @@
 
 namespace logs
 {
-	void init(const std::wstring &exe_dir);
+	void init();
 	void raw_write(const char *s);
 	void write_line(const char *level, const char *msg);
 	std::string vfmt(const char *fmt, ...);

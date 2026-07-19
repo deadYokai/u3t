@@ -33,14 +33,14 @@ doesn't care about straight through to the real DLL.
 
 ## Verifying it loaded
 
-CU3ML writes a rotating log file (`dinput8.log`) next to the game's `.exe`.
+CU3ML writes a rotating log file (`cu3ml.log`) next to the game's `.exe`.
 On a successful start you should see something like:
 
 ```text
-[info] CU3ML mod loader (x64 build)
-[ok]   found 1 mod(s): ExampleMod
-[ok]   UE3 layout resolved (validated=1)
-[ok]   init_thread: ready
+[INFO ] CU3ML mod loader (x64 build)
+[INFO ]   found 1 mod(s): ExampleMod
+[INFO ]   UE3 layout resolved (validated=1)
+[INFO ]   init_thread: ready
 ```
 
 If `validated=0` shows up instead, the disassembly-based resolver couldn't

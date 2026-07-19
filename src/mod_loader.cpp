@@ -122,9 +122,9 @@ namespace
 		return out;
 	}
 
-	static void discover_mods(const std::wstring &exe_dir)
+	static void discover_mods()
 	{
-		std::wstring mods_dir = exe_dir + L"\\..\\..\\Mods";
+		std::wstring mods_dir = get_mods_dir();
 		CreateDirectoryW(mods_dir.c_str(), nullptr);
 
 		WIN32_FIND_DATAW fd{};
@@ -211,7 +211,7 @@ namespace mod_loader
 {
 	void discover()
 	{
-		discover_mods(get_exe_dir());
+		discover_mods();
 		g_mods = topo_sort(std::move(g_mods));
 		build_tables();
 		log_info("mod_loader: discovery done — %zu mod(s)  %zu replace(s)",

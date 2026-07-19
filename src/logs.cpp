@@ -14,12 +14,12 @@ namespace logs
 	static SRWLOCK g_lock = SRWLOCK_INIT;
 	static std::atomic<bool> g_initialized{false};
 
-	void init(const std::wstring &exe_dir)
+	void init()
 	{
 		AcquireSRWLockExclusive(&g_lock);
 		if (!g_initialized)
 		{
-			std::wstring path = exe_dir + L"\\cu3ml.log";
+			std::wstring path = get_mods_dir() + L"\\cu3ml.log";
 			HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
 			                       nullptr, CREATE_ALWAYS,
 			                       FILE_ATTRIBUTE_NORMAL, nullptr);

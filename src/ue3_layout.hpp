@@ -14,6 +14,13 @@ struct FNameStack
 	int32_t Number;
 };
 
+struct UE3TArray
+{
+	void *Data;
+	int32_t Num;
+	int32_t Max;
+};
+
 struct FArchiveFields
 {
 	int32_t ArVer, ArNetVer, ArLicenseeVer, ArIsLoading, ArIsSaving,
@@ -59,6 +66,21 @@ namespace ue3raw
 	}
 
 	inline void wr_u64(void *base, ptrdiff_t off, uint64_t v)
+	{
+		memcpy(at(base, off), &v, sizeof(v));
+	}
+
+	inline void wr_u32(void *base, ptrdiff_t off, uint32_t v)
+	{
+		memcpy(at(base, off), &v, sizeof(v));
+	}
+
+	inline void wr_i32(void *base, ptrdiff_t off, int32_t v)
+	{
+		memcpy(at(base, off), &v, sizeof(v));
+	}
+
+	inline void wr_ptr(void *base, ptrdiff_t off, void *v)
 	{
 		memcpy(at(base, off), &v, sizeof(v));
 	}
@@ -108,6 +130,7 @@ struct UE3Layout
 	void *Preload = nullptr;
 
 	void **GPackageFileCache = nullptr;
+	void **GConfig = nullptr;
 	TArrayView *FNameNames = nullptr;
 	uint8_t *FNameNamesArr = nullptr;
 	void **GSerializedObject = nullptr;
@@ -130,8 +153,16 @@ struct UE3Layout
 	ptrdiff_t l_OriginalLoader = 0;
 
 	ptrdiff_t exp_stride = 0;
+	ptrdiff_t e_ObjectName = 0;
+	ptrdiff_t e_OuterIndex = 0;
+	ptrdiff_t e_ClassIndex = 0;
+	ptrdiff_t e_SuperIndex = 0;
+	ptrdiff_t e_ArchetypeIndex = 0;
+	ptrdiff_t e_ObjectFlags = 0;
 	ptrdiff_t e_SerialSize = 0;
 	ptrdiff_t e_SerialOffset = 0;
+	ptrdiff_t e_Object = 0;
+	ptrdiff_t e_iHashNext = 0;
 	ptrdiff_t e_ExportFlags = 0;
 
 	ptrdiff_t vt_Serialize = 0;       // UObject::Serialize
@@ -270,6 +301,21 @@ inline int32_t exp_serial_offset(const void *e)
 inline uint32_t exp_export_flags(const void *e)
 {
 	return e ? ue3raw::rd_u32(e, ue3().e_ExportFlags) : 0u;
+}
+
+inline void *exp_object(const void *e)
+{
+	return e ? ue3raw::rd_ptr(e, ue3().e_Object) : nullptr;
+}
+
+inline int32_t exp_outer_index(const void *e)
+{
+	return e ? static_cast<int32_t>(ue3raw::rd_u32(e, ue3().e_OuterIndex)) : 0;
+}
+
+inline int32_t exp_class_index(const void *e)
+{
+	return e ? static_cast<int32_t>(ue3raw::rd_u32(e, ue3().e_ClassIndex)) : 0;
 }
 
 // --- FName table ---

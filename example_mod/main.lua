@@ -30,4 +30,3 @@ if handled and text then
 	ue3.log("obj classes returned " .. tostring(#text) .. " bytes")
 end
 
-ue3.localize("DisGFxMoviePlayerMenuBase_Texts", "t_QuitGame", "DishonoredGame", "ABABA")

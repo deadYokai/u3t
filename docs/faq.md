@@ -15,7 +15,7 @@ Probably, but there's no guaranteed list. CU3ML doesn't ship a
 per-title offset table — it re-derives the layout by disassembling
 whatever `.exe` it's loaded into. Different compilers, different
 optimization settings, and different UE3 fork ages can all change how
-that goes. Check `dinput8.log` after launch; `validated=1` is the signal
+that goes. Check `cu3ml.log` after launch; `validated=1` is the signal
 that it's on solid ground.
 
 ## Is it safe to use online / in multiplayer?
@@ -42,7 +42,7 @@ No. Overrides are intercepted at `Preload` time, in memory. The original
 ## Something crashed on startup
 
 Restore the original game folder (remove `dinput8.dll`) and file an issue
-with your `dinput8.log` attached. Since the loader is disassembling your
+with your `cu3ml.log` attached. Since the loader is disassembling your
 specific game build at runtime, the log is the only way to tell which
 step it got to.
 

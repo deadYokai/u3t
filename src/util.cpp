@@ -14,6 +14,20 @@ std::wstring get_exe_dir()
 	return (pos != std::wstring::npos) ? path.substr(0, pos) : path;
 }
 
+std::wstring get_mods_dir()
+{
+	std::wstring path = get_exe_dir() + L"\\..\\..\\Mods";
+
+	wchar_t buffer[MAX_PATH];
+
+	DWORD len = GetFullPathNameW(path.c_str(), MAX_PATH, buffer, nullptr);
+
+	if (len == 0 || len >= MAX_PATH)
+		return L"";
+
+	return std::wstring(buffer, len);
+}
+
 std::wstring to_wide(const std::string &s)
 {
 	if (s.empty())

@@ -8,6 +8,7 @@
 #include <Zydis/Zydis.h>
 
 std::wstring get_exe_dir();
+std::wstring get_mods_dir();
 std::wstring to_wide(const std::string &s);
 std::string to_narrow(const std::wstring &w);
 

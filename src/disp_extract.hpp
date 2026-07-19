@@ -43,4 +43,8 @@ namespace dx
 
 	void *call_feeding_global_store(const void *begin, const void *end,
 	                                void **global);
+
+	int x64_argnum_liveness(const void *begin, const void *end,
+	                        int max_insns = 32);
+
 }  // namespace dx

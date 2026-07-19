@@ -1,5 +1,6 @@
 #include "ue3_layout.hpp"
 
+#include "addr_cache.hpp"
 #include "anchor.hpp"
 #include "disp_extract.hpp"
 #include "disp_extract_arch.hpp"
@@ -31,8 +32,16 @@ namespace
 		L.sizeof_UObject = o_Class + 2 * PS;
 		L.l_LinkerRoot = L.sizeof_UObject;
 
+		L.e_ObjectName = 0x00;
+		L.e_OuterIndex = 0x08;
+		L.e_ClassIndex = 0x0C;
+		L.e_SuperIndex = 0x10;
+		L.e_ArchetypeIndex = 0x14;
+		L.e_ObjectFlags = 0x18;
 		L.e_SerialSize = 0x20;
 		L.e_SerialOffset = 0x24;
+		L.e_Object = 0x30;
+		L.e_iHashNext = 0x30 + PS;
 		L.e_ExportFlags = 0x30 + PS + 4;
 	}
 
@@ -60,6 +69,35 @@ namespace
 	}
 }  // namespace
 
+static void dump_layout(const UE3Layout &L, const char *how)
+{
+	constexpr ptrdiff_t PS_ = static_cast<ptrdiff_t>(sizeof(void *));
+	const bool override_ok = L.Preload && L.l_FArchiveOff && L.exp_stride &&
+	                         L.l_ExportMap && L.l_Loader && L.vt_Serialize &&
+	                         L.GSerializedObject && L.FNameNamesArr &&
+	                         L.name.str_off;
+	const bool find_ok = L.StaticFindObjectFast && L.FNameInit;
+
+	log_info("resolve[%d-bit, %s]: GPL=%p SFOF=%p SLO=%p Init=%p Preload=%p",
+	         (int)(PS_ * 8), how, L.GetPackageLinker, L.StaticFindObjectFast,
+	         L.StaticLoadObject, L.FNameInit, L.Preload);
+	log_info("resolve: GConfig=%p (%p)", (void *)L.GConfig,
+	         L.GConfig ? *L.GConfig : nullptr);
+	log_info("resolve: FArchiveOff=0x%zX stride=0x%zX Name/Imp/Exp=0x%zX/0x%zX/"
+	         "0x%zX Loader=0x%zX Root=0x%zX",
+	         (size_t)L.l_FArchiveOff, (size_t)L.exp_stride, (size_t)L.l_NameMap,
+	         (size_t)L.l_ImportMap, (size_t)L.l_ExportMap, (size_t)L.l_Loader,
+	         (size_t)L.l_LinkerRoot);
+	log_info(
+	    "resolve: uobj Flags/Linker/LinkerIdx/Outer/Name=0x%zX/0x%zX/0x%zX/"
+	    "0x%zX/0x%zX vtSerialize=0x%zX str_off=%zu wf=%d",
+	    (size_t)L.o_ObjectFlags, (size_t)L.o_Linker, (size_t)L.o_LinkerIndex,
+	    (size_t)L.o_Outer, (size_t)L.o_Name, (size_t)L.vt_Serialize,
+	    L.name.str_off, (int)L.name.with_flags);
+	log_info("resolve: override_ok=%d find_ok=%d", (int)override_ok,
+	         (int)find_ok);
+}
+
 bool ue3_resolve(UE3Layout &L)
 {
 	ModuleImage img = anchor::image_of(nullptr);
@@ -69,6 +107,12 @@ bool ue3_resolve(UE3Layout &L)
 		return false;
 	}
 	fill_formula_offsets(L);
+
+	if (addr_cache::load_ue3(L))
+	{
+		dump_layout(L, "cached");
+		return L.ok;
+	}
 
 	L.GetPackageLinker = anchor::only(
 	    anchor::functions_referencing_wstr(img, L"PackageResolveFailed"),
@@ -82,6 +126,32 @@ bool ue3_resolve(UE3Layout &L)
 			L.GPackageFileCache = g;
 		else
 			log_warn("resolve: GPackageFileCache not found");
+	}
+
+	{
+		static const wchar_t *kCfgAnchors[] = {L"UnrealEd.EditorEngine",
+		                                       L"Editor.EditorEngine"};
+		void *fn = nullptr;
+		for (const wchar_t *a : kCfgAnchors)
+		{
+			fn = anchor::only(anchor::functions_referencing_wstr(img, a),
+			                  "appScriptOutputDir");
+			if (fn)
+				break;
+		}
+		if (!fn)
+			log_warn("resolve: appScriptOutputDir anchor missing (GConfig "
+			         "falls back to runtime capture)");
+		else
+		{
+			void **g = nullptr;
+			if (dx::first_rip_global_noncookie(
+			        fn, anchor::function_end(img, fn), g))
+				L.GConfig = g;
+			else
+				log_warn("resolve: GConfig not derived from "
+				         "appScriptOutputDir");
+		}
 	}
 
 	L.StaticFindObjectFast = anchor::only(
@@ -218,28 +288,21 @@ bool ue3_resolve(UE3Layout &L)
 	if (L.FNameNamesArr && !probe_name_layout(L.FNameNamesArr, L.name))
 		log_warn("resolve: FName entry layout probe failed");
 
-	const bool override_ok = L.Preload && L.l_FArchiveOff && L.exp_stride &&
-	                         L.l_ExportMap && L.l_Loader && L.vt_Serialize &&
-	                         L.GSerializedObject && L.FNameNamesArr &&
-	                         L.name.str_off;
-	const bool find_ok = L.StaticFindObjectFast && L.FNameInit;
-	L.ok = override_ok;
+	L.ok = L.Preload && L.l_FArchiveOff && L.exp_stride && L.l_ExportMap &&
+	       L.l_Loader && L.vt_Serialize && L.GSerializedObject &&
+	       L.FNameNamesArr && L.name.str_off;
 
-	log_info("resolve[%d-bit]: GPL=%p SFOF=%p SLO=%p Init=%p Preload=%p",
-	         (int)(PS * 8), L.GetPackageLinker, L.StaticFindObjectFast,
-	         L.StaticLoadObject, L.FNameInit, L.Preload);
-	log_info("resolve: FArchiveOff=0x%zX stride=0x%zX Name/Imp/Exp=0x%zX/0x%zX/"
-	         "0x%zX Loader=0x%zX Root=0x%zX",
-	         (size_t)L.l_FArchiveOff, (size_t)L.exp_stride, (size_t)L.l_NameMap,
-	         (size_t)L.l_ImportMap, (size_t)L.l_ExportMap, (size_t)L.l_Loader,
-	         (size_t)L.l_LinkerRoot);
-	log_info(
-	    "resolve: uobj Flags/Linker/LinkerIdx/Outer/Name=0x%zX/0x%zX/0x%zX/"
-	    "0x%zX/0x%zX vtSerialize=0x%zX str_off=%zu wf=%d",
-	    (size_t)L.o_ObjectFlags, (size_t)L.o_Linker, (size_t)L.o_LinkerIndex,
-	    (size_t)L.o_Outer, (size_t)L.o_Name, (size_t)L.vt_Serialize,
-	    L.name.str_off, (int)L.name.with_flags);
-	log_info("resolve: override_ok=%d find_ok=%d", (int)override_ok,
-	         (int)find_ok);
+	dump_layout(L, "scanned");
+
+	if (L.ok)
+	{
+		addr_cache::store_ue3(L);
+		addr_cache::save();
+	}
+	else
+	{
+		log_warn("resolve: layout incomplete — not caching");
+	}
+
 	return L.ok;
 }
