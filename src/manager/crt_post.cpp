@@ -175,7 +175,7 @@ namespace crt_post
 
 		gl.BindFramebuffer(GL_FRAMEBUFFER, g_fbo);
 		glViewport(0, 0, width, height);
-		glClearColor(0.047f, 0.027f, 0.012f, 1.0f);
+		glClearColor(0.082f, 0.051f, 0.024f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 	}
 
