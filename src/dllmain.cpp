@@ -92,36 +92,58 @@ std::wstring lower(std::wstring s)
 
 const std::vector<std::wstring> &tokens()
 {
-	static std::vector<std::wstring> toks;
-	static bool done = false;
-	if (done)
-		return toks;
-	done = true;
-
-	const wchar_t *raw = GetCommandLineW();
-	if (!raw)
-		return toks;
-
-	std::wstring cur;
-	bool in_quote = false;
-	for (const wchar_t *p = raw; *p; ++p)
+	static const std::vector<std::wstring> toks = []
 	{
-		if (*p == L'"')
+		std::vector<std::wstring> out;
+		const wchar_t *raw = GetCommandLineW();
+		if (!raw)
+			return out;
+
+		std::wstring cur;
+		bool in_quote = false;
+		bool quoted = false;
+		unsigned bs = 0;
+
+		for (const wchar_t *p = raw; *p; ++p)
 		{
-			in_quote = !in_quote;
-			continue;
+			if (*p == L'\\')
+			{
+				++bs;
+				continue;
+			}
+			if (*p == L'"')
+			{
+				cur.append(bs / 2, L'\\');
+				if (bs % 2)
+				{
+					cur += L'"';
+				}
+				else
+				{
+					in_quote = !in_quote;
+					quoted = true;
+				}
+				bs = 0;
+				continue;
+			}
+			cur.append(bs, L'\\');
+			bs = 0;
+
+			if (!in_quote && (*p == L' ' || *p == L'\t'))
+			{
+				if (!cur.empty() || quoted)
+					out.push_back(cur);
+				cur.clear();
+				quoted = false;
+				continue;
+			}
+			cur += *p;
 		}
-		if (!in_quote && (*p == L' ' || *p == L'\t'))
-		{
-			if (!cur.empty())
-				toks.push_back(cur);
-			cur.clear();
-			continue;
-		}
-		cur += *p;
-	}
-	if (!cur.empty())
-		toks.push_back(cur);
+		cur.append(bs, L'\\');
+		if (!cur.empty() || quoted)
+			out.push_back(cur);
+		return out;
+	}();
 	return toks;
 }
 
@@ -245,17 +267,10 @@ static bool install_engine_loop_init_hook()
 			return false;
 		}
 
-		auto hits =
-		    anchor::functions_referencing_wstr(img, L"NoTextureStreaming");
-		if (hits.size() != 1)
-		{
-			log_err("install_engine_loop_init_hook: anchor ambiguous/missing "
-			        "(%zu hits) — check this build",
-			        hits.size());
-			return false;
-		}
+		static const wchar_t *kAnchors[] = {
+		    L"engine-ini:Engine.Engine.GameEngine", L"nosound"};
+		target = ue3_api::resolve_wstr_all(kAnchors, 2, "GEngineLoop::Init");
 
-		target = hits.front();
 		log_info("install_engine_loop_init_hook: GEngineLoop::Init = %p "
 		         "(scanned)",
 		         target);

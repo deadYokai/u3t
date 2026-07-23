@@ -11,6 +11,141 @@
 
 namespace anchor
 {
+	namespace
+	{
+		constexpr bool kNative64 = (sizeof(void *) == 8);
+
+		void init_decoder(ZydisDecoder &dec, bool x64)
+		{
+			ZydisDecoderInit(&dec,
+			                 x64 ? ZYDIS_MACHINE_MODE_LONG_64
+			                     : ZYDIS_MACHINE_MODE_LEGACY_32,
+			                 x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
+		}
+
+		uint8_t *rel32_target(const uint8_t *p, bool accept_jmp)
+		{
+			if (p[0] != 0xE8 && !(accept_jmp && p[0] == 0xE9))
+				return nullptr;
+			int32_t rel;
+			memcpy(&rel, p + 1, 4);
+			return const_cast<uint8_t *>(p) + 5 + rel;
+		}
+
+		template <class F>
+		void for_each_rel32(const uint8_t *entry, const uint8_t *end,
+		                    bool accept_jmp, bool skip_operand, F &&visit)
+		{
+			if (!entry || !end)
+				return;
+			for (const uint8_t *p = entry; p + 5 <= end; ++p)
+			{
+				uint8_t *tgt = rel32_target(p, accept_jmp);
+				if (!tgt)
+					continue;
+				if (visit(const_cast<uint8_t *>(p), tgt))
+					return;
+				if (skip_operand)
+					p += 4;
+			}
+		}
+
+		void dedupe(std::vector<void *> &v)
+		{
+			std::sort(v.begin(), v.end());
+			v.erase(std::unique(v.begin(), v.end()), v.end());
+		}
+	}  // namespace
+
+	struct XrefEntry
+	{
+		uint32_t target;
+		uint32_t site;
+	};
+
+	std::vector<XrefEntry> g_xrefs;
+	const uint8_t *g_xref_base = nullptr;
+	bool g_xref_built = false;
+
+	bool operand_target(const ModuleImage &img, const uint8_t *p, uint8_t len,
+	                    const ZydisDecodedOperand &op, uintptr_t &out)
+	{
+		if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+		    op.mem.base == ZYDIS_REGISTER_RIP && op.mem.disp.has_displacement)
+		{
+			out = reinterpret_cast<uintptr_t>(p + len) +
+			      static_cast<int32_t>(op.mem.disp.value);
+			return true;
+		}
+		if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+		    op.mem.base == ZYDIS_REGISTER_NONE &&
+		    op.mem.index == ZYDIS_REGISTER_NONE && op.mem.disp.has_displacement)
+		{
+			out = img.x64 ? static_cast<uintptr_t>(op.mem.disp.value)
+			              : static_cast<uintptr_t>(
+			                    static_cast<uint32_t>(op.mem.disp.value));
+			return true;
+		}
+		if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && !op.imm.is_relative)
+		{
+			out = static_cast<uintptr_t>(op.imm.value.u);
+			return true;
+		}
+		return false;
+	}
+
+	void build_xref_index(const ModuleImage &img)
+	{
+		g_xrefs.clear();
+		g_xref_base = img.base;
+		g_xref_built = true;
+
+		const uintptr_t lo = reinterpret_cast<uintptr_t>(img.base);
+		const uintptr_t hi = lo + img.size;
+
+		ZydisDecoder dec;
+		init_decoder(dec, img.x64);
+		g_xrefs.reserve(img.text_size / 64);
+
+		uint8_t *p = img.text;
+		uint8_t *end = img.text + img.text_size;
+		while (p < end)
+		{
+			ZydisDecodedInstruction in;
+			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, end - p, &in, ops)))
+			{
+				++p;
+				continue;
+			}
+			for (uint8_t i = 0; i < in.operand_count_visible; ++i)
+			{
+				uintptr_t tgt;
+				if (!operand_target(img, p, in.length, ops[i], tgt))
+					continue;
+				if (tgt < lo || tgt >= hi)
+					continue;
+				g_xrefs.push_back({static_cast<uint32_t>(tgt - lo),
+				                   static_cast<uint32_t>(p - img.base)});
+			}
+			p += in.length;
+		}
+
+		std::sort(g_xrefs.begin(), g_xrefs.end(),
+		          [](const XrefEntry &a, const XrefEntry &b)
+		          {
+			          return a.target != b.target ? a.target < b.target
+			                                      : a.site < b.site;
+		          });
+		g_xrefs.erase(
+		    std::unique(g_xrefs.begin(), g_xrefs.end(),
+		                [](const XrefEntry &a, const XrefEntry &b)
+		                { return a.target == b.target && a.site == b.site; }),
+		    g_xrefs.end());
+
+		log_info("anchor: xref index built (%zu refs over %zu bytes)",
+		         g_xrefs.size(), img.text_size);
+	}
 
 	void *only(const std::vector<void *> &v, const char *what)
 	{
@@ -29,11 +164,7 @@ namespace anchor
 	                               const uint8_t *interior)
 	{
 		ZydisDecoder dec;
-		ZydisDecoderInit(&dec,
-		                 sizeof(void *) == 8 ? ZYDIS_MACHINE_MODE_LONG_64
-		                                     : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 sizeof(void *) == 8 ? ZYDIS_STACK_WIDTH_64
-		                                     : ZYDIS_STACK_WIDTH_32);
+		init_decoder(dec, kNative64);
 		ZydisDecodedInstruction in;
 		const uint8_t *p = start;
 		while (p < interior)
@@ -79,7 +210,7 @@ namespace anchor
 	static bool callee_argnum_matches(ZydisDecoder &dec, const uint8_t *entry,
 	                                  const uint8_t *limit, int argnum)
 	{
-		if (sizeof(void *) == 8)
+		if (kNative64)
 			return dx::x64_argnum_liveness(entry, limit) == argnum;
 
 		const uint64_t want_pop = static_cast<uint64_t>(argnum) *
@@ -129,7 +260,7 @@ namespace anchor
 	                                          const CH *needle)
 	{
 		std::vector<const void *> out;
-		if (!img.ok)
+		if (!img.ok || !needle)
 			return out;
 		const size_t n = std::char_traits<CH>::length(needle);
 		const size_t bytes = (n + 1) * sizeof(CH);
@@ -162,67 +293,29 @@ namespace anchor
 		std::vector<void *> out;
 		if (!img.ok)
 			return out;
-		const auto target = reinterpret_cast<uintptr_t>(data);
+		if (!g_xref_built || g_xref_base != img.base)
+			build_xref_index(img);
 
-		ZydisDecoder dec;
-		ZydisDecoderInit(&dec,
-		                 img.x64 ? ZYDIS_MACHINE_MODE_LONG_64
-		                         : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 img.x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
+		const uintptr_t lo = reinterpret_cast<uintptr_t>(img.base);
+		const uintptr_t t = reinterpret_cast<uintptr_t>(data);
+		if (t < lo || t >= lo + img.size)
+			return out;
+		const uint32_t rva = static_cast<uint32_t>(t - lo);
 
-		uint8_t *p = img.text;
-		uint8_t *end = img.text + img.text_size;
-
-		while (p < end)
-		{
-			ZydisDecodedInstruction in;
-			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, end - p, &in, ops)))
-			{
-				++p;
-				continue;
-			}
-
-			for (uint8_t i = 0; i < in.operand_count_visible; ++i)
-			{
-				const auto &op = ops[i];
-				uintptr_t tgt;
-
-				if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
-				    op.mem.base == ZYDIS_REGISTER_RIP &&
-				    op.mem.disp.has_displacement)
-				{
-					tgt = reinterpret_cast<uintptr_t>(p + in.length) +
-					      static_cast<int32_t>(op.mem.disp.value);
-				}
-				else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
-				         op.mem.base == ZYDIS_REGISTER_NONE &&
-				         op.mem.index == ZYDIS_REGISTER_NONE &&
-				         op.mem.disp.has_displacement)
-				{
-					tgt = img.x64
-					          ? static_cast<uintptr_t>(op.mem.disp.value)
-					          : static_cast<uintptr_t>(
-					                static_cast<uint32_t>(op.mem.disp.value));
-				}
-				else if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-				         !op.imm.is_relative)
-				{
-					tgt = static_cast<uintptr_t>(op.imm.value.u);
-				}
-				else
-				{
-					continue;
-				}
-				if (tgt == target)
-				{
-					out.push_back(p);
-					break;
-				}
-			}
-			p += in.length;
-		}
+		auto it = std::lower_bound(g_xrefs.begin(), g_xrefs.end(), rva,
+		                           [](const XrefEntry &e, uint32_t v)
+		                           { return e.target < v; });
+		for (; it != g_xrefs.end() && it->target == rva; ++it)
+			out.push_back(img.base + it->site);
 		return out;
+	}
+
+	void reset_xref_index()
+	{
+		g_xrefs.clear();
+		g_xrefs.shrink_to_fit();
+		g_xref_built = false;
+		g_xref_base = nullptr;
 	}
 
 	static IMAGE_DATA_DIRECTORY exception_dir(const ModuleImage &img)
@@ -338,11 +431,7 @@ namespace anchor
 			return out;
 
 		ZydisDecoder dec;
-		ZydisDecoderInit(&dec,
-		                 sizeof(void *) == 8 ? ZYDIS_MACHINE_MODE_LONG_64
-		                                     : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 sizeof(void *) == 8 ? ZYDIS_STACK_WIDTH_64
-		                                     : ZYDIS_STACK_WIDTH_32);
+		init_decoder(dec, kNative64);
 
 		const uint8_t *b = static_cast<const uint8_t *>(begin);
 		const uint8_t *e = static_cast<const uint8_t *>(end);
@@ -379,99 +468,89 @@ namespace anchor
 			return out;
 
 		ZydisDecoder dec;
-		ZydisDecoderInit(&dec,
-		                 img.x64 ? ZYDIS_MACHINE_MODE_LONG_64
-		                         : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 img.x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
+		init_decoder(dec, img.x64);
 
 		uint8_t *text_end = img.text + img.text_size;
 
-		uint8_t *p = entry;
-		for (; p + 5 <= end; ++p)
-		{
-			if (p[0] != 0xE8)
-				continue;
-			int32_t rel;
-			memcpy(&rel, p + 1, 4);
-			uint8_t *tgt = p + 5 + rel;
-			if (tgt < img.text || tgt >= text_end)
-				continue;
-			if (callee_argnum_matches(dec, tgt, text_end, argnum))
-				out.push_back(tgt);
-			p += 4;
-		}
+		for_each_rel32(
+		    entry, end, false, true,
+		    [&](uint8_t *, uint8_t *tgt)
+		    {
+			    if (tgt >= img.text && tgt < text_end &&
+			        callee_argnum_matches(dec, tgt, text_end, argnum))
+				    out.push_back(tgt);
+			    return false;
+		    });
 
-		std::sort(out.begin(), out.end());
-		out.erase(std::unique(out.begin(), out.end()), out.end());
+		dedupe(out);
 		return out;
+	}
+
+	template <typename CH>
+	static std::vector<void *> functions_referencing(const ModuleImage &img,
+	                                                 const CH *needle)
+	{
+		std::vector<void *> fns;
+		for (const void *s : find_lit<CH>(img, needle))
+			for (void *site : find_refs(img, s))
+				if (void *fn = function_entry(img, site))
+					fns.push_back(fn);
+		dedupe(fns);
+		return fns;
 	}
 
 	std::vector<void *> functions_referencing_wstr(const ModuleImage &img,
 	                                               const wchar_t *needle)
 	{
-		std::vector<void *> fns;
-		for (const void *s : find_wstr_all(img, needle))
-			for (void *site : find_refs(img, s))
-				if (void *fn = function_entry(img, site))
-					fns.push_back(fn);
-		std::sort(fns.begin(), fns.end());
-		fns.erase(std::unique(fns.begin(), fns.end()), fns.end());
-		return fns;
+		return functions_referencing<wchar_t>(img, needle);
 	}
 
 	std::vector<void *> functions_referencing_cstr(const ModuleImage &img,
 	                                               const char *needle)
 	{
-		std::vector<void *> fns;
-		for (const void *s : find_cstr_all(img, needle))
-			for (void *site : find_refs(img, s))
-				if (void *fn = function_entry(img, site))
-					fns.push_back(fn);
-		std::sort(fns.begin(), fns.end());
-		fns.erase(std::unique(fns.begin(), fns.end()), fns.end());
-		return fns;
+		return functions_referencing<char>(img, needle);
 	}
 
 	bool function_calls(const ModuleImage &img, void *entry, const void *target)
 	{
 		if (!img.ok || !entry)
 			return false;
-		uint8_t *p = reinterpret_cast<uint8_t *>(entry);
-		uint8_t *end = function_end(img, entry);
-		for (; p + 5 <= end; ++p)
-		{
-			if (p[0] != 0xE8)
-				continue;
-			int32_t rel;
-			memcpy(&rel, p + 1, 4);
-			if (reinterpret_cast<uint8_t *>(p + 5) + rel ==
-			    reinterpret_cast<const uint8_t *>(target))
-				return true;
-		}
-		return false;
+		bool hit = false;
+		for_each_rel32(reinterpret_cast<uint8_t *>(entry),
+		               function_end(img, entry), false, false,
+		               [&](uint8_t *, uint8_t *tgt)
+		               {
+			               if (tgt == reinterpret_cast<const uint8_t *>(target))
+			               {
+				               hit = true;
+				               return true;
+			               }
+			               return false;
+		               });
+		return hit;
 	}
 
 	void *nth_call_target(const ModuleImage &img, void *entry, int n)
 	{
 		if (!img.ok || !entry)
 			return nullptr;
-		uint8_t *p = reinterpret_cast<uint8_t *>(entry);
-		uint8_t *end = function_end(img, entry);
+		uint8_t *text_end = img.text + img.text_size;
+		void *found = nullptr;
 		int seen = 0;
-		for (; p + 5 <= end; ++p)
-		{
-			if (p[0] != 0xE8 && p[0] != 0xE9)
-				continue;
-			int32_t rel;
-			memcpy(&rel, p + 1, 4);
-			uint8_t *tgt = p + 5 + rel;
-			if (tgt < img.text || tgt >= img.text + img.text_size)
-				continue;
-			if (seen++ == n)
-				return tgt;
-			p += 4;
-		}
-		return nullptr;
+		for_each_rel32(reinterpret_cast<uint8_t *>(entry),
+		               function_end(img, entry), true, true,
+		               [&](uint8_t *, uint8_t *tgt)
+		               {
+			               if (tgt < img.text || tgt >= text_end)
+				               return false;
+			               if (seen++ == n)
+			               {
+				               found = tgt;
+				               return true;
+			               }
+			               return false;
+		               });
+		return found;
 	}
 
 	std::vector<void *> direct_callers(const ModuleImage &img,
@@ -480,22 +559,16 @@ namespace anchor
 		std::vector<void *> out;
 		if (!img.ok || !target)
 			return out;
-		uint8_t *p = img.text;
-		uint8_t *end = img.text + img.text_size - 5;
-		for (; p < end; ++p)
-		{
-			if (p[0] != 0xE8)
-				continue;
-			int32_t rel;
-			memcpy(&rel, p + 1, 4);
-			if (reinterpret_cast<uint8_t *>(p + 5) + rel !=
-			    reinterpret_cast<const uint8_t *>(target))
-				continue;
-			if (void *fn = function_entry(img, p))
-				out.push_back(fn);
-		}
-		std::sort(out.begin(), out.end());
-		out.erase(std::unique(out.begin(), out.end()), out.end());
+		for_each_rel32(img.text, img.text + img.text_size, false, false,
+		               [&](uint8_t *site, uint8_t *tgt)
+		               {
+			               if (tgt == reinterpret_cast<const uint8_t *>(target))
+				               if (void *fn = function_entry(img, site))
+					               out.push_back(fn);
+			               return false;
+		               });
+		dedupe(out);
 		return out;
 	}
+
 }  // namespace anchor

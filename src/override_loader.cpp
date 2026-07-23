@@ -16,6 +16,8 @@
 
 #include <windows.h>
 
+#include "lua_host.hpp"
+
 static constexpr int kVT_MAX = 64;
 
 static std::vector<uint8_t> read_file(const std::wstring &path)
@@ -453,6 +455,83 @@ static void call_object_serialize(void *obj, void *linker)
 		*ue3().GSerializedObject = prev_serial;
 }
 
+struct NewExportSpec
+{
+	int32_t index = -1;
+	std::wstring path;       // full object path; also the override key
+	std::string class_name;  // informational only
+	int32_t class_index = 0;
+	int32_t outer_index = 0;
+	int32_t super_index = 0;
+	int32_t archetype_index = 0;
+	uint64_t object_flags = 0;
+	uint32_t export_flags = 0;
+	int32_t serial_size = 0;
+	std::wstring bin_name;
+};
+
+struct PendingExports
+{
+	std::wstring pkg;
+	std::vector<NewExportSpec> specs;
+	bool injected = false;
+	bool failed = false;
+
+	int32_t expected_base() const
+	{
+		return specs.empty() ? -1 : specs.front().index - 1;
+	}
+};
+
+static std::wstring lower_w(std::wstring s)
+{
+	std::transform(s.begin(), s.end(), s.begin(),
+	               [](wchar_t c) { return (wchar_t)towlower(c); });
+	return s;
+}
+
+static inline void orig_preload(void *linker, void *obj)
+{
+	if (linker && g_orig_Preload)
+		g_orig_Preload(linker_farchive(linker), obj);
+}
+
+static std::unordered_map<std::wstring, PendingExports> g_new_exports;
+static int g_preload_depth = 0;
+
+enum PendingState
+{
+	kPending_None = 0,
+	kPending_Ready = 1,
+	kPending_Waiting = 2,
+	kPending_Failed = 3,
+};
+
+static std::wstring linker_root_name(void *linker)
+{
+	if (!linker)
+		return {};
+	void *root = linker_root(linker);
+	if (!root || !safe_read(root, ue3().sizeof_UObject))
+		return {};
+	return fname_str(uobj_name_index(root));
+}
+
+static PendingState pending_state_for_linker(void *linker)
+{
+	if (g_new_exports.empty() || !linker)
+		return kPending_None;
+	const std::wstring root = linker_root_name(linker);
+	if (root.empty())
+		return kPending_None;
+	auto it = g_new_exports.find(lower_w(root));
+	if (it == g_new_exports.end())
+		return kPending_None;
+	if (it->second.failed)
+		return kPending_Failed;
+	return it->second.injected ? kPending_Ready : kPending_Waiting;
+}
+
 static void do_override_preload(void *linker, void *obj, void *exp,
                                 override_loader::OverrideRecord &rec)
 {
@@ -462,6 +541,35 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 	{
 		g_orig_Preload(linker, obj);
 		return;
+	}
+
+	if (!rec.pkg.empty())
+	{
+		const std::wstring root = linker_root_name(linker);
+		if (lower_w(root) != lower_w(rec.pkg))
+		{
+			log_warn("override: '%ls' was dumped from '%ls' but this object's "
+			         "linker root is '%ls' (ExportMap=%d NameMap=%d) — passing "
+			         "through",
+			         rec.key.c_str(), rec.pkg.c_str(),
+			         root.empty() ? L"<unknown>" : root.c_str(),
+			         linker_exportmap(linker).num, linker_namemap(linker).num);
+			orig_preload(linker, obj);
+			return;
+		}
+	}
+
+	switch (pending_state_for_linker(linker))
+	{
+		case kPending_Waiting:
+		case kPending_Failed:
+			log_warn("override: '%ls' needs new exports that are not injected "
+			         "into '%ls' — passing through",
+			         rec.key.c_str(), rec.pkg.c_str());
+			orig_preload(linker, obj);
+			return;
+		default:
+			break;
 	}
 
 	void *real_loader = *linker_loader_ptr(linker);
@@ -531,50 +639,6 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 
 	log_info("override: full-port '%ls' consumed=%zu/%zu bytes",
 	         rec.key.c_str(), br.pos, br.size);
-}
-
-static inline void orig_preload(void *linker, void *obj)
-{
-	if (linker && g_orig_Preload)
-		g_orig_Preload(linker_farchive(linker), obj);
-}
-
-struct NewExportSpec
-{
-	int32_t index = -1;
-	std::wstring path;       // full object path; also the override key
-	std::string class_name;  // informational only
-	int32_t class_index = 0;
-	int32_t outer_index = 0;
-	int32_t super_index = 0;
-	int32_t archetype_index = 0;
-	uint64_t object_flags = 0;
-	uint32_t export_flags = 0;
-	int32_t serial_size = 0;
-	std::wstring bin_name;
-};
-
-struct PendingExports
-{
-	std::wstring pkg;
-	std::vector<NewExportSpec> specs;
-	bool injected = false;
-	bool failed = false;
-
-	int32_t expected_base() const
-	{
-		return specs.empty() ? -1 : specs.front().index - 1;
-	}
-};
-
-static std::unordered_map<std::wstring, PendingExports> g_new_exports;
-static int g_preload_depth = 0;
-
-static std::wstring lower_w(std::wstring s)
-{
-	std::transform(s.begin(), s.end(), s.begin(),
-	               [](wchar_t c) { return (wchar_t)towlower(c); });
-	return s;
 }
 
 static bool parse_num(const std::string &s, int64_t &out)
@@ -837,12 +901,16 @@ static PendingExports *pending_for_linker(void *linker)
 		return nullptr;
 	void *root = linker_root(linker);
 	if (!root || !safe_read(root, ue3().sizeof_UObject))
+	{
+		log_warn("newexports: linker=%p LinkerRoot unreadable (%p)", linker,
+		         root);
 		return nullptr;
+	}
 	const std::wstring pkg = fname_str(uobj_name_index(root));
-	if (pkg.empty())
-		return nullptr;
 	auto it = g_new_exports.find(lower_w(pkg));
-	return it == g_new_exports.end() ? nullptr : &it->second;
+	if (it == g_new_exports.end())
+		return nullptr;
+	return &it->second;
 }
 
 static void try_inject_for_linker(void *linker, const char *why)
@@ -896,7 +964,7 @@ static void maybe_inject_new_exports(void *linker)
 	try_inject_for_linker(linker, "Preload/fallback");
 }
 
-static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
+static void preload_call(void *farchive, void *obj)
 {
 	struct DepthGuard
 	{
@@ -980,6 +1048,15 @@ static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
 	do_override_preload(linker, obj, exp, *rec);
 }
 
+static void __fastcall hooked_Preload(void *farchive, UE3_EDX void *obj)
+{
+	const bool needed = obj && uobj_has_flag(obj, RF_NeedLoad);
+
+	preload_call(farchive, obj);
+	if (needed)
+		lua_host::notify_preloaded(obj);
+}
+
 static std::unordered_map<std::wstring, override_loader::OverrideRecord>
     g_overrides;
 
@@ -1055,12 +1132,14 @@ static void scan_package_dir(const std::wstring &pkg_dir,
 		std::wstring key = stem;
 		override_loader::OverrideRecord rec;
 		rec.key = key;
+		rec.pkg = pkg_name;
 		rec.bin = std::move(bin);
 		if (names)
 			rec.tool_names = *names;
 		g_overrides[key] = std::move(rec);
-		log_info("override: registered '%ls'  bin=%zu names=%zu mod='%s'",
-		         key.c_str(), g_overrides[key].bin.size(),
+		log_info("override: registered '%ls'  pkg='%ls' bin=%zu names=%zu "
+		         "mod='%s'",
+		         key.c_str(), pkg_name.c_str(), g_overrides[key].bin.size(),
 		         g_overrides[key].tool_names.size(), lm.cfg.name.c_str());
 	} while (FindNextFileW(h, &fd));
 	FindClose(h);

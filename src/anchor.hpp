@@ -49,4 +49,6 @@ namespace anchor
 
 	std::vector<void *> direct_callers(const ModuleImage &img,
 	                                   const void *target);
+
+	void reset_xref_index();
 }  // namespace anchor

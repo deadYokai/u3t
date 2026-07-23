@@ -4,6 +4,7 @@
 #include "anchor.hpp"
 #include "disp_extract.hpp"
 #include "disp_extract_arch.hpp"
+#include "ue3_api.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -28,8 +29,8 @@ namespace
 		L.o_LinkerIndex = L.o_Linker + PS;
 		L.o_Outer = L.o_LinkerIndex + 8;
 		L.o_Name = L.o_Outer + PS;
-		ptrdiff_t o_Class = L.o_Name + 8;
-		L.sizeof_UObject = o_Class + 2 * PS;
+		L.o_Class = L.o_Name + 8;
+		L.sizeof_UObject = L.o_Class + 2 * PS;
 		L.l_LinkerRoot = L.sizeof_UObject;
 
 		L.e_ObjectName = 0x00;
@@ -129,16 +130,23 @@ bool ue3_resolve(UE3Layout &L)
 	}
 
 	{
+		// (UnrealEd.EditorEngine | Editor.EditorEngine) & EditPackages & !Core
 		static const wchar_t *kCfgAnchors[] = {L"UnrealEd.EditorEngine",
 		                                       L"Editor.EditorEngine"};
+		static const wchar_t *kCfgNot[] = {L"Core"};
+
+		log_info("Resolving `appScriptOutputDir` -- if it has 1 warn - its ok");
+
 		void *fn = nullptr;
 		for (const wchar_t *a : kCfgAnchors)
 		{
-			fn = anchor::only(anchor::functions_referencing_wstr(img, a),
-			                  "appScriptOutputDir");
+			const wchar_t *yes[] = {a, L"EditPackages"};
+			fn = ue3_api::resolve_wstr_all_not(yes, kCfgNot, 2,
+			                                   "appScriptOutputDir");
 			if (fn)
 				break;
 		}
+
 		if (!fn)
 			log_warn("resolve: appScriptOutputDir anchor missing (GConfig "
 			         "falls back to runtime capture)");
@@ -153,7 +161,6 @@ bool ue3_resolve(UE3Layout &L)
 				         "appScriptOutputDir");
 		}
 	}
-
 	L.StaticFindObjectFast = anchor::only(
 	    anchor::functions_referencing_wstr(
 	        img,

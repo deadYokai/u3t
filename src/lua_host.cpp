@@ -6,7 +6,9 @@
 
 #include "addr_cache.hpp"
 #include "loader_config.hpp"
+#include "util.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,8 +29,102 @@
 #include "ue3_layout.hpp"
 #include "util.hpp"
 
+#include "lua_lib.hpp"
+
+#include "manager/msg_box.hpp"
+
 namespace
 {
+	std::vector<sol::protected_function> g_map_cbs;
+	void *g_orig_loadmap = nullptr;
+
+	void fire_map_callbacks()
+	{
+		for (auto &fn : g_map_cbs)
+		{
+			try
+			{
+				auto r = fn();
+				if (!r.valid())
+				{
+					sol::error e = r;
+					log_err("lua: on_map_load callback: %s", e.what());
+				}
+			}
+			catch (const std::exception &e)
+			{
+				log_err("lua: on_map_load callback threw: %s", e.what());
+			}
+			catch (...)
+			{
+				log_err("lua: on_map_load callback threw");
+			}
+		}
+	}
+
+#ifdef _WIN64
+	using LoadMapFn = int (*)(void *, const void *, void *, void *);
+
+	int loadmap_detour(void *self, const void *URL, void *Pending, void *Error)
+	{
+		const int r = reinterpret_cast<LoadMapFn>(g_orig_loadmap)(
+		    self, URL, Pending, Error);
+#else
+	using LoadMapFn = int(__fastcall *)(void *, void *, const void *, void *,
+	                                    void *);
+
+	int __fastcall loadmap_detour(void *self, void *edx, const void *URL,
+	                              void *Pending, void *Error)
+	{
+		const int r = reinterpret_cast<LoadMapFn>(g_orig_loadmap)(
+		    self, edx, URL, Pending, Error);
+#endif
+		log_info("lua: LoadMap returned %d, firing %zu callback(s)", r,
+		         g_map_cbs.size());
+		fire_map_callbacks();
+		return r;
+	}
+
+	bool ensure_map_hook()
+	{
+		static bool tried = false;
+		if (tried)
+			return g_orig_loadmap != nullptr;
+		tried = true;
+
+		static const wchar_t *kAnchors[] = {L"Game=", L"quiet", L"TheWorld"};
+		void *fn =
+		    ue3_api::resolve_wstr_all(kAnchors, 3, "UGameEngine::LoadMap");
+		if (!fn)
+		{
+			log_warn("lua: on_map_load — LoadMap not resolved");
+			return false;
+		}
+		hook::add(fn, (void *)&loadmap_detour, &g_orig_loadmap);
+		hook::install_all();
+		return g_orig_loadmap != nullptr;
+	}
+}  // namespace
+
+namespace
+{
+	struct PreloadWatch
+	{
+		std::string path;
+		sol::protected_function fn;
+		sol::object payload;
+		bool once = true;
+	};
+
+	inline uint64_t name_key(int32_t idx, int32_t num)
+	{
+		return ((uint64_t)(uint32_t)idx << 32) | (uint32_t)num;
+	}
+
+	std::unordered_map<uint64_t, std::vector<PreloadWatch>> g_preload_watch;
+	std::atomic<size_t> g_preload_live{0};
+	std::mutex g_preload_mtx;
+
 	sol::state *g_lua = nullptr;
 	bool g_enabled = true;
 	bool g_verbose = false;
@@ -68,6 +164,13 @@ namespace
 	{
 		for (auto &c : s)
 			c = (wchar_t)towlower(c);
+		return s;
+	}
+
+	std::string lower_ascii(std::string s)
+	{
+		for (auto &c : s)
+			c = towlower(c);
 		return s;
 	}
 
@@ -810,6 +913,66 @@ namespace
 		return true;
 	}
 
+	bool safe_read(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
+
+	std::string fname_str(int32_t gidx)
+	{
+		UE3Layout &L = ue3();
+		void *e = fname_entry(gidx);
+		if (!e || !L.name.str_off || !safe_read(e, L.name.str_off + 2))
+			return {};
+		if (L.name.is_unicode(e))
+		{
+			const wchar_t *s = L.name.uni(e);
+			return safe_read(s, 2) ? to_narrow(std::wstring(s)) : std::string{};
+		}
+		const char *s = L.name.ansi(e);
+		return safe_read(s, 1) ? std::string(s) : std::string{};
+	}
+
+	std::string name_of(const void *obj)
+	{
+		if (!obj || !safe_read(obj, (size_t)ue3().sizeof_UObject))
+			return {};
+		std::string s = fname_str(uobj_name_index(obj));
+		const int32_t num = uobj_name_number(obj);
+		if (num > 0)
+			s += "_" + std::to_string(num - 1);
+		return s;
+	}
+
+	std::string path_of(const void *obj)
+	{
+		std::vector<std::string> parts;
+		const void *cur = obj;
+		for (int d = 0; d < 16 && cur; ++d)
+		{
+			std::string seg = name_of(cur);
+			if (seg.empty())
+				return {};
+			parts.push_back(seg);
+			cur = uobj_outer(cur);
+		}
+		std::string out;
+		for (auto it = parts.rbegin(); it != parts.rend(); ++it)
+		{
+			if (!out.empty())
+				out += '.';
+			out += *it;
+		}
+		return out;
+	}
+
+	bool path_matches(const std::string &full, const std::string &want)
+	{
+		if (want.empty() || full == want)
+			return true;
+		return full.size() > want.size() &&
+		       full.compare(full.size() - want.size(), want.size(), want) ==
+		           0 &&
+		       full[full.size() - want.size() - 1] == '.';
+	}
+
 	void bind_ue3(sol::state &lua)
 	{
 		lua.set_function("print",
@@ -912,9 +1075,8 @@ namespace
 			                                 int32_t);
 			    std::wstring w = to_wide(path);
 			    void *res = reinterpret_cast<Fn>(slo)(
-			        /*InClass*/ nullptr, /*InOuter*/ outer.value_or(nullptr),
-			        w.c_str(), /*Filename*/ nullptr, /*LoadFlags*/ 0,
-			        /*Sandbox*/ nullptr, /*bAllowReconciliation*/ 1);
+			        nullptr, outer.value_or(nullptr), w.c_str(), nullptr, 0,
+			        nullptr, 1);
 			    if (!res)
 				    return sol::nullopt;
 			    return res;
@@ -1112,7 +1274,179 @@ namespace
 				    if (!gconfig || !fn)
 					    return;
 				    std::wstring w = to_wide(filename);
-				    fn(gconfig, w.c_str(), /*Fallback*/ nullptr);
+				    fn(gconfig, w.c_str(), nullptr);
+			    });
+		}
+
+		tbl.set_function("on_map_load",
+		                 [](sol::protected_function fn) -> bool
+		                 {
+			                 if (!fn.valid() || !ensure_map_hook())
+				                 return false;
+			                 g_map_cbs.push_back(std::move(fn));
+			                 return true;
+		                 });
+
+		{
+			sol::table obj_tbl = tbl["obj"].get_or_create<sol::table>();
+			obj_tbl.set_function("path", [](void *o) { return path_of(o); });
+
+			auto intern_leaf = [](const std::string &path) -> uint64_t
+			{
+				void *init = ue3().FNameInit;
+				if (!init)
+					return 0;
+				const size_t dot = path.rfind('.');
+				const std::string leaf =
+				    (dot == std::string::npos) ? path : path.substr(dot + 1);
+				FNameStack nm{};
+				using InitFn = void(UE3_THISCALL *)(void *, const wchar_t *,
+				                                    int, int, int);
+				reinterpret_cast<InitFn>(init)(&nm, to_wide(leaf).c_str(), 0, 1,
+				                               1);
+				return name_key(nm.Index, nm.Number);
+			};
+
+			obj_tbl.set_function(
+			    "on_preload",
+			    [intern_leaf](const std::string &path,
+			                  sol::protected_function fn,
+			                  sol::optional<bool> verbose,
+			                  sol::optional<bool> once) -> bool
+			    {
+				    if (!fn.valid())
+					    return false;
+
+				    const uint64_t key = intern_leaf(path);
+
+				    if (!key)
+				    {
+					    log_warn("lua: on_preload — FName::Init unresolved");
+					    return false;
+				    }
+
+				    PreloadWatch pw;
+				    pw.path = lower_ascii(path);
+				    pw.fn = std::move(fn);
+				    pw.once = once.value_or(true);
+
+				    std::lock_guard<std::mutex> lk(g_preload_mtx);
+				    g_preload_watch[key].push_back(std::move(pw));
+				    g_preload_live.fetch_add(1, std::memory_order_relaxed);
+				    if (verbose)
+					    log_info("lua: on_preload watching '%s' (key %llu)",
+					             path.c_str(), (unsigned long long)key);
+				    return true;
+			    });
+
+			obj_tbl.set_function(
+			    "on_preload_many",
+			    [intern_leaf](sol::table map, sol::protected_function fn,
+			                  sol::optional<bool> once) -> int
+			    {
+				    if (!fn.valid())
+					    return 0;
+				    if (!ue3().FNameInit)
+				    {
+					    log_warn(
+					        "lua: on_preload_many — FName::Init unresolved");
+					    return 0;
+				    }
+
+				    const bool one_shot = once.value_or(true);
+				    int added = 0;
+
+				    std::lock_guard<std::mutex> lk(g_preload_mtx);
+				    for (auto &kv : map)
+				    {
+					    if (kv.first.get_type() != sol::type::string)
+						    continue;
+					    const std::string path = kv.first.as<std::string>();
+					    const uint64_t key = intern_leaf(path);
+					    if (!key)
+						    continue;
+
+					    PreloadWatch pw;
+					    pw.path = lower_ascii(path);
+					    pw.fn = fn;
+					    pw.payload = kv.second;
+					    pw.once = one_shot;
+
+					    g_preload_watch[key].push_back(std::move(pw));
+					    ++added;
+				    }
+				    g_preload_live.fetch_add((size_t)added,
+				                             std::memory_order_relaxed);
+				    return added;
+			    });
+		}
+
+		lua_lib::bind(lua);
+
+		{
+			sol::table msg_box = lua.create_named_table("msg_box");
+
+			msg_box.new_enum(
+			    "Icon", "None", msg_box::Icon::None, "Info",
+			    msg_box::Icon::Info, "Warning", msg_box::Icon::Warning, "Error",
+			    msg_box::Icon::Error, "Question", msg_box::Icon::Question);
+
+			msg_box.new_usertype<msg_box::Result>(
+			    "Result", sol::default_constructor, "closed",
+			    &msg_box::Result::closed, "button_index",
+			    &msg_box::Result::button_index, "button_label",
+			    &msg_box::Result::button_label);
+
+			msg_box.new_usertype<msg_box::Config>(
+			    "Config", sol::default_constructor, "title",
+			    &msg_box::Config::title, "message", &msg_box::Config::message,
+			    "icon", &msg_box::Config::icon, "buttons",
+			    sol::property([](msg_box::Config &cfg)
+			                  { return sol::as_table(cfg.buttons); },
+			                  [](msg_box::Config &cfg, sol::table t)
+			                  {
+				                  cfg.buttons.clear();
+				                  for (auto &kv : t)
+				                  {
+					                  cfg.buttons.push_back(
+					                      kv.second.as<std::string>());
+				                  }
+			                  }),
+			    "default_button", &msg_box::Config::default_button,
+			    "escape_button", &msg_box::Config::escape_button, "width",
+			    &msg_box::Config::width);
+
+			msg_box.set_function("show", &msg_box::show);
+			msg_box.set_function("show_info", &msg_box::show_info);
+			msg_box.set_function("show_warning", &msg_box::show_warning);
+			msg_box.set_function("show_error", &msg_box::show_error);
+			msg_box.set_function("show_confirm", &msg_box::show_confirm);
+			msg_box.set_function("draw", &msg_box::draw);
+			msg_box.set_function("poll", &msg_box::poll);
+			msg_box.set_function("active", &msg_box::active);
+
+			msg_box.set_function(
+			    "make_config",
+			    [](sol::table t)
+			    {
+				    msg_box::Config cfg;
+				    cfg.title = t.get_or("title", cfg.title);
+				    cfg.message = t.get_or("message", cfg.message);
+				    cfg.icon = t.get_or("icon", cfg.icon);
+				    if (t["buttons"].valid())
+				    {
+					    cfg.buttons.clear();
+					    for (auto &kv : t["buttons"].get<sol::table>())
+					    {
+						    cfg.buttons.push_back(kv.second.as<std::string>());
+					    }
+				    }
+				    cfg.default_button =
+				        t.get_or("default_button", cfg.default_button);
+				    cfg.escape_button =
+				        t.get_or("escape_button", cfg.escape_button);
+				    cfg.width = t.get_or("width", cfg.width);
+				    return cfg;
 			    });
 		}
 
@@ -1234,6 +1568,7 @@ namespace lua_host
 
 	void shutdown()
 	{
+		lua_lib::unload_all();
 		if (g_lua)
 		{
 			delete g_lua;
@@ -1295,6 +1630,65 @@ namespace lua_host
 		if (g_verbose)
 			log_info("lua: run_file(%ls) -> %d", path.c_str(), (int)ok);
 		return ok;
+	}
+
+	void notify_preloaded(void *obj)
+	{
+		if (!obj || !g_lua)
+			return;
+		if (g_preload_live.load(std::memory_order_relaxed) == 0)
+			return;
+
+		const uint64_t key =
+		    name_key(uobj_name_index(obj), uobj_name_number(obj));
+
+		std::vector<std::pair<sol::protected_function, sol::object>> to_run;
+		{
+			std::lock_guard<std::mutex> lk(g_preload_mtx);
+
+			auto it = g_preload_watch.find(key);
+			if (it == g_preload_watch.end())
+				return;
+
+			const std::string path = lower_ascii(path_of(obj));
+			if (path.empty())
+				return;
+
+			auto &vec = it->second;
+			for (size_t k = 0; k < vec.size();)
+			{
+				auto &w = vec[k];
+				if (!path_matches(path, w.path))
+				{
+					++k;
+					continue;
+				}
+				if (w.once)
+				{
+					to_run.emplace_back(std::move(w.fn), std::move(w.payload));
+					vec[k] = std::move(vec.back());
+					vec.pop_back();
+					g_preload_live.fetch_sub(1, std::memory_order_relaxed);
+				}
+				else
+				{
+					to_run.emplace_back(w.fn, w.payload);
+					++k;
+				}
+			}
+			if (vec.empty())
+				g_preload_watch.erase(it);
+		}
+
+		for (auto &[fn, arg] : to_run)
+		{
+			auto r = arg.valid() ? fn(obj, arg) : fn(obj);
+			if (!r.valid())
+			{
+				sol::error e = r;
+				log_err("lua: on_preload callback: %s", e.what());
+			}
+		}
 	}
 
 }  // namespace lua_host

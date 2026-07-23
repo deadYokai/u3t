@@ -2,7 +2,8 @@ title = "CU3ML"
 description = "Crappy Unreal Engine 3 Mod Loader"
 author = "deadYokai"
 url = "https://docs.yokai.digital/cu3ml/"
-hljs_langs = ["cpp", "bash", "toml", "cmake"]
+project_url = "https://projects.yokai.digital/cu3ml"
+hljs_langs = ["cpp", "bash", "toml", "cmake", "lua", "ini"]
 
 [[nav]]
 title = "Overview"
@@ -15,6 +16,18 @@ file = "getting-started.md"
 [[nav]]
 title = "Mod Format"
 file = "mod-format.md"
+
+[[nav]]
+title = "Lua Scripting"
+file = "lua-api.md"
+
+[[nav]]
+title = "Configuration"
+file = "configuration.md"
+
+[[nav]]
+title = "Manager"
+file = "manager.md"
 
 [[nav]]
 title = "Architecture"

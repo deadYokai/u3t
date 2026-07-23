@@ -162,6 +162,7 @@ struct UE3Layout
 	ptrdiff_t e_SerialSize = 0;
 	ptrdiff_t e_SerialOffset = 0;
 	ptrdiff_t e_Object = 0;
+	ptrdiff_t o_Class = 0;
 	ptrdiff_t e_iHashNext = 0;
 	ptrdiff_t e_ExportFlags = 0;
 
@@ -222,6 +223,11 @@ inline int32_t uobj_name_index(const void *o)
 inline int32_t uobj_name_number(const void *o)
 {
 	return static_cast<int32_t>(ue3raw::rd_u32(o, ue3().o_Name + 4));
+}
+
+inline void *uobj_class(const void *o)
+{
+	return ue3raw::rd_ptr(o, ue3().o_Class);
 }
 
 // --- ULinkerLoad ---

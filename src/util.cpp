@@ -16,16 +16,42 @@ std::wstring get_exe_dir()
 
 std::wstring get_mods_dir()
 {
-	std::wstring path = get_exe_dir() + L"\\..\\..\\Mods";
+    std::wstring path = get_exe_dir();
 
-	wchar_t buffer[MAX_PATH];
+    constexpr int max_depth = 3;
 
-	DWORD len = GetFullPathNameW(path.c_str(), MAX_PATH, buffer, nullptr);
+    for (int i = 0; i < max_depth; ++i)
+    {
+        size_t pos = path.find_last_of(L"\\/");
 
-	if (len == 0 || len >= MAX_PATH)
-		return L"";
+        if (pos == std::wstring::npos)
+            break;
 
-	return std::wstring(buffer, len);
+        std::wstring dir = path.substr(pos + 1);
+
+        if (dir == L"Binaries")
+        {
+            std::wstring mods = path.substr(0, pos) + L"\\Mods";
+
+            wchar_t buffer[MAX_PATH];
+
+            DWORD len = GetFullPathNameW(
+                mods.c_str(),
+                MAX_PATH,
+                buffer,
+                nullptr
+            );
+
+            if (len == 0 || len >= MAX_PATH)
+                return L"";
+
+            return std::wstring(buffer, len);
+        }
+
+        path.resize(pos);
+    }
+
+    return L"";
 }
 
 std::wstring to_wide(const std::string &s)

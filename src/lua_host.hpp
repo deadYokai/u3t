@@ -20,4 +20,6 @@ namespace lua_host
 
 	bool run_file(const std::wstring &path);
 
+	void notify_preloaded(void *obj);
+
 }  // namespace lua_host

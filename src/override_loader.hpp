@@ -1,5 +1,6 @@
 #pragma once
 #include "config.hpp"
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@ namespace override_loader
 {
 	struct OverrideRecord
 	{
+		std::wstring pkg;
 		std::wstring key;
 		std::vector<uint8_t> bin;
 		std::vector<std::string> tool_names;
