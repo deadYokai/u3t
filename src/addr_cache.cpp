@@ -422,6 +422,7 @@ namespace addr_cache
 	X("ue3.vt_Serialize", vt_Serialize)         \
 	X("ue3.name.str_off", name.str_off)         \
 	X("ue3.name.with_flags", name.with_flags)   \
+	X("ue3.name.always_wide", name.always_wide) \
 	X("ue3.ar.Serialize", ar.Serialize)         \
 	X("ue3.ar.SerializeName", ar.SerializeName) \
 	X("ue3.ar.Tell", ar.Tell)                   \

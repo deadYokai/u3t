@@ -43,17 +43,23 @@ namespace
 
 		for (const auto &r : g_replaces)
 		{
-			if (r.original == Name)
+			if (r.original != Name)
+				continue;
+			if (r.replacement.empty())
 			{
-				log_info("slo_hook: replace '%ls' -> '%ls'", Name,
-				         r.replacement.c_str());
-				s_in_hook = true;
-				void *res =
-				    g_orig_slo(InClass, nullptr, r.replacement.c_str(), nullptr,
-				               LoadFlags, Sandbox, bAllowReconciliation);
-				s_in_hook = false;
-				return res;
+				log_warn(
+				    "slo_hook: empty replacement for '%ls' - passing through",
+				    Name);
+				break;
 			}
+			log_info("slo_hook: replace '%ls' -> '%ls'", Name,
+			         r.replacement.c_str());
+			s_in_hook = true;
+			void *res =
+			    g_orig_slo(InClass, InOuter, r.replacement.c_str(), Filename,
+			               LoadFlags, Sandbox, bAllowReconciliation);
+			s_in_hook = false;
+			return res;
 		}
 
 		return g_orig_slo(InClass, InOuter, Name, Filename, LoadFlags, Sandbox,

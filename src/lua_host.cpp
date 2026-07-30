@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +31,9 @@
 #include "lua_lib.hpp"
 
 #include "manager/msg_box.hpp"
+#include "mutex_wrapper.hpp"
+
+#include "callconv.hpp"
 
 namespace
 {
@@ -62,23 +64,14 @@ namespace
 		}
 	}
 
-#ifdef _WIN64
-	using LoadMapFn = int (*)(void *, const void *, void *, void *);
-
-	int loadmap_detour(void *self, const void *URL, void *Pending, void *Error)
-	{
-		const int r = reinterpret_cast<LoadMapFn>(g_orig_loadmap)(
-		    self, URL, Pending, Error);
-#else
-	using LoadMapFn = int(__fastcall *)(void *, void *, const void *, void *,
-	                                    void *);
-
-	int __fastcall loadmap_detour(void *self, void *edx, const void *URL,
+	int __fastcall loadmap_detour(void *self, UE3_EDX_ARG const void *URL,
 	                              void *Pending, void *Error)
 	{
-		const int r = reinterpret_cast<LoadMapFn>(g_orig_loadmap)(
-		    self, edx, URL, Pending, Error);
-#endif
+		static dx::CallConvInvoker<int, void *, const void *, void *, void *>
+		    orig(g_orig_loadmap, dx::CallConv::Thiscall);
+
+		const int r = orig(self, URL, Pending, Error);
+
 		log_info("lua: LoadMap returned %d, firing %zu callback(s)", r,
 		         g_map_cbs.size());
 		fire_map_callbacks();
@@ -123,7 +116,7 @@ namespace
 
 	std::unordered_map<uint64_t, std::vector<PreloadWatch>> g_preload_watch;
 	std::atomic<size_t> g_preload_live{0};
-	std::mutex g_preload_mtx;
+	Mutex g_preload_mtx;
 
 	sol::state *g_lua = nullptr;
 	bool g_enabled = true;
@@ -203,7 +196,7 @@ namespace
 		}
 	}
 
-	std::mutex g_loc_mtx;
+	Mutex g_loc_mtx;
 	std::unordered_map<std::wstring, std::wstring> g_loc_overrides;
 	void *g_orig_localize = nullptr;
 	void *g_orig_get_section = nullptr;
@@ -264,10 +257,10 @@ namespace
 		if (!ra)
 			return;
 		unsigned bytes = (unsigned)((s.size() + 1) * sizeof(wchar_t));
-		using Fn = void *(*)(void *, unsigned, unsigned);
-		void *data = (sizeof(void *) == 8)
-		                 ? reinterpret_cast<Fn>(ra)(nullptr, 0, bytes)
-		                 : reinterpret_cast<Fn>(ra)(nullptr, bytes, 8);
+		static dx::CallConvInvoker<void *, void *, unsigned, unsigned> Fn(ra, dx::CallConv::Thiscall);
+
+		void *data = (sizeof(void *) == 8) ? Fn(nullptr, 0, bytes)
+		                                   : Fn(nullptr, bytes, 8);
 		if (!data)
 			return;
 		memcpy(data, s.c_str(), s.size() * sizeof(wchar_t));
@@ -294,37 +287,11 @@ namespace
 		return result;
 	}
 
-	using FNameInitFn = void(UE3_THISCALL *)(FNameStack *self,
-	                                         const wchar_t *name, int number,
-	                                         int findType, int bSplitName);
-	using AddFn = EngFString *(UE3_THISCALL *)(void *Sec, EngFString *Key,
-	                                           EngFString *Value);
-	using RemoveKeyFn = int(UE3_THISCALL *)(void *Sec, EngFString *Key);
-
 	struct PairInitFN
 	{
 		FNameStack Key;
 		EngFString *Value;
 	};
-
-	using RemoveKeyFNFn = int(UE3_THISCALL *)(void *Sec, FNameStack Key);
-	using AddFNFn = int *(UE3_THISCALL *)(void *Sec, int *outIdx,
-	                                      PairInitFN *kv, int *outFlag);
-
-	using SetStringFn = void(UE3_THISCALL *)(void *self, const wchar_t *Section,
-	                                         const wchar_t *Key,
-	                                         const wchar_t *Value,
-	                                         const wchar_t *Filename);
-
-	using SetArrayFn = void(UE3_THISCALL *)(void *self, const wchar_t *Section,
-	                                        const wchar_t *Key,
-	                                        const UE3TArray *Value,
-	                                        const wchar_t *Filename);
-
-	using GetArrayFn = int(UE3_THISCALL *)(void *self, const wchar_t *Section,
-	                                       const wchar_t *Key,
-	                                       UE3TArray *Result,
-	                                       const wchar_t *Filename);
 
 	void *g_key_ctor = nullptr;
 	bool g_fname_keyed = false;
@@ -490,7 +457,10 @@ namespace
 							in_all = true;
 				}
 				if (in_all)
+				{
 					ctor = c.second;
+					break;
+				}
 			}
 			if (!ctor)
 				continue;
@@ -520,18 +490,16 @@ namespace
 			*out_remove_key = rem;
 			*out_combine = b;
 			*out_key_ctor = (void *)ctor;
-			*out_fname_keyed = key_is_by_value(v, rem_ctor_i, rem_op_i);
+			const auto rk = dx::detect_call_conv(rem);
+			*out_fname_keyed = (rk.stack_cleanup_bytes >= 8);
+			log_info("lua: removekey=%p ret=%d fname_keyed=%d", rem,
+			         rk.stack_cleanup_bytes, (int)*out_fname_keyed);
 			log_info("lua: localize - keyctor=%p fname_keyed=%d",
 			         (const void *)ctor, (int)*out_fname_keyed);
 			return true;
 		}
 		return false;
 	}
-
-	using GetSectionFn = void *(__fastcall *)(void *self,
-	                                          const wchar_t *Section, int Force,
-	                                          int Const,
-	                                          const wchar_t *Filename);
 
 	struct SecOp
 	{
@@ -573,10 +541,14 @@ namespace
 		void *self = cfg_self();
 		if (!self || !g_orig_get_section || !Section || !Filename)
 			return nullptr;
-		auto fn = reinterpret_cast<GetSectionFn>(g_orig_get_section);
-		void *Sec = fn(self, Section, 0, 1, Filename);
+
+		static dx::CallConvInvoker<void *, void *, UE3_EDX const wchar_t *, int,
+		                           int, const wchar_t *>
+		    fn(g_orig_get_section, dx::CallConv::Thiscall);
+
+		void *Sec = fn(self, UE3_EDX_NULL Section, 0, 1, Filename);
 		if (!Sec && create)
-			Sec = fn(self, Section, 1, 0, Filename);
+			Sec = fn(self, UE3_EDX_NULL Section, 1, 0, Filename);
 		return Sec;
 	}
 
@@ -607,6 +579,12 @@ namespace
 
 		if (g_fname_keyed)
 		{
+			using FNameInitFn = void(UE3_THISCALL *)(
+			    FNameStack *, const wchar_t *, int, int, int);
+			using RemoveKeyFNFn = int(UE3_THISCALL *)(void *, FNameStack);
+			using AddFNFn =
+			    int *(UE3_THISCALL *)(void *, int *, PairInitFN *, int *);
+
 			FNameStack fn{};
 			reinterpret_cast<FNameInitFn>(g_key_ctor)(&fn, op.key.c_str(), 0, 1,
 			                                          1);
@@ -621,6 +599,10 @@ namespace
 		}
 		else
 		{
+			using RemoveKeyFn = int(UE3_THISCALL *)(void *, EngFString *);
+			using AddFn = EngFString *(UE3_THISCALL *)(void *, EngFString *,
+			                                           EngFString *);
+
 			EngFString KeyStr{};
 			build_eng_fstring(&KeyStr, op.key);
 			if (op.remove)
@@ -664,18 +646,22 @@ namespace
 		g_sec_pending.swap(keep);
 	}
 
-	void *__fastcall get_section_detour(void *self, const wchar_t *Section,
+	void *__fastcall get_section_detour(void *self,
+	                                    UE3_EDX_ARG const wchar_t *Section,
 	                                    int Force, int Const,
 	                                    const wchar_t *Filename)
 	{
 		if (!g_gconfig && self)
 			g_gconfig = self;
 
-		void *Sec = reinterpret_cast<GetSectionFn>(g_orig_get_section)(
-		    self, Section, Force, Const, Filename);
+		static dx::CallConvInvoker<void *, void *, const wchar_t *, int, int,
+		                           const wchar_t *>
+		    orig(g_orig_get_section, dx::CallConv::Thiscall);
+
+		void *Sec = orig(self, Section, Force, Const, Filename);
 
 		std::wstring pkg = package_from_filename(Filename);
-		std::lock_guard<std::mutex> lk(g_loc_mtx);
+		LockGuard lk(g_loc_mtx);
 
 		if (!pkg.empty() && Filename)
 			g_file_by_pkg[lower(pkg)] = Filename;
@@ -718,20 +704,15 @@ namespace
 		return Sec;
 	}
 
-	using LocalizeFn = void *(__cdecl *)(void *, const wchar_t *,
-	                                     const wchar_t *, const wchar_t *,
-	                                     const wchar_t *, int);
-
-	void *__cdecl localize_detour(void *ret, const wchar_t *Section,
-	                              const wchar_t *Key, const wchar_t *Package,
-	                              const wchar_t *Lang, int bOpt)
+	void *localize_detour(void *ret, const wchar_t *Section, const wchar_t *Key,
+	                      const wchar_t *Package, const wchar_t *Lang, int bOpt)
 	{
 		if (Section && Key && Package)
 		{
 			std::wstring v;
 			bool have = false;
 			{
-				std::lock_guard<std::mutex> lk(g_loc_mtx);
+				LockGuard lk(g_loc_mtx);
 				auto it = g_loc_overrides.find(loc_key(Package, Section, Key));
 				if (it != g_loc_overrides.end())
 				{
@@ -745,24 +726,34 @@ namespace
 				return ret;
 			}
 		}
-		return reinterpret_cast<LocalizeFn>(g_orig_localize)(
-		    ret, Section, Key, Package, Lang, bOpt);
+
+		static dx::CallConvInvoker<void *, void *, const wchar_t *,
+		                           const wchar_t *, const wchar_t *,
+		                           const wchar_t *, int>
+		    orig(g_orig_localize);
+		return orig(ret, Section, Key, Package, Lang, bOpt);
 	}
 
-	using FindFileFn = void *(UE3_THISCALL *)(void *, const wchar_t *, int);
 	static void *g_orig_find_file = nullptr;
 
 	void *__fastcall find_file_detour(void *self,
-	                                  UE3_EDX const wchar_t *Filename,
+	                                  UE3_EDX_ARG const wchar_t *Filename,
 	                                  int CreateIfNotFound)
 	{
-		void *File = reinterpret_cast<FindFileFn>(g_orig_find_file)(
-		    self, Filename, CreateIfNotFound);
+		static dx::CallConvInvoker<void *, void *, const wchar_t *, int> orig(
+		    g_orig_find_file, dx::CallConv::Thiscall);
+
+		void *File = orig(self, Filename, CreateIfNotFound);
 
 		if (!g_gconfig && self)
 			g_gconfig = self;
+
 		static thread_local bool in_flush = false;
+
 		if (in_flush || !File || !Filename)
+			return File;
+
+		if (!cfg_self())
 			return File;
 
 		std::wstring pkg = package_from_filename(Filename);
@@ -771,12 +762,48 @@ namespace
 
 		in_flush = true;
 		{
-			std::lock_guard<std::mutex> lk(g_loc_mtx);
+			LockGuard lk(g_loc_mtx);
 			g_file_by_pkg[lower(pkg)] = Filename;
-			sec_flush_pending();
+			if (cfg_self())
+				sec_flush_pending();
 		}
 		in_flush = false;
 		return File;
+	}
+
+	static void *resolve_call_at(const anchor::ModuleImage &img,
+	                             const void *from, void **gconfig_vtbl)
+	{
+		void *entry = anchor::function_entry(img, from);
+		if (!entry)
+			entry = const_cast<void *>(from);
+		uint8_t *end = anchor::function_end(img, entry);
+		if (!end)
+			return nullptr;
+		std::vector<SweepInsn> v;
+		if (!sweep(static_cast<const uint8_t *>(entry), end, v))
+			return nullptr;
+
+		const uint8_t *fromp = static_cast<const uint8_t *>(from);
+		for (int i = 0; i < (int)v.size(); ++i)
+		{
+			if (v[i].m != ZYDIS_MNEMONIC_CALL || v[i].p < fromp)
+				continue;
+
+			if (v[i].tgt)
+				return anchor::resolve_thunk(img, (void *)v[i].tgt, 8);
+			if (!gconfig_vtbl)
+				return nullptr;
+			if (v[i].has_mem && v[i].mem_base != ZYDIS_REGISTER_NONE &&
+			    v[i].mem_disp > 0)
+				return gconfig_vtbl[v[i].mem_disp / sizeof(void *)];
+			for (int j = i - 1; j >= 0 && j >= i - 8; --j)
+				if (v[j].m == ZYDIS_MNEMONIC_MOV && v[j].has_mem &&
+				    v[j].mem_base != ZYDIS_REGISTER_NONE && v[j].mem_disp > 0)
+					return gconfig_vtbl[v[j].mem_disp / sizeof(void *)];
+			return nullptr;
+		}
+		return nullptr;
 	}
 
 	static void resolve_lua_addrs(LuaAddrLayout &L)
@@ -823,26 +850,57 @@ namespace
 			log_warn("lua: Combine/section ops unresolved");
 		}
 
-		L.GetSectionPrivate = anchor::nth_call_target(img, L.LoadAllClasses, 0);
+		void *gconfig = cfg_self();
+		if (!gconfig)
+		{
+			log_warn("lua: GConfig not live yet - section hooks deferred");
+			return;
+		}
+
+		void **vtbl = *reinterpret_cast<void ***>(gconfig);
+		auto in_mod = [&](void *p)
+		{ return p && p >= img.base && p < img.base + img.size; };
+
+		L.GetSectionPrivate = nullptr;
+		L.FindFile = nullptr;
+		for (const void *s :
+		     anchor::find_wstr_all(img, L"ConfigCoalesceFilter"))
+		{
+			for (void *site : anchor::find_refs(img, s))
+			{
+				void *cand = resolve_call_at(img, site, vtbl);
+				if (!in_mod(cand))
+					continue;
+				void *find = anchor::nth_call_target(img, cand, 0);
+				if (in_mod(find) && find != cand)
+				{
+					L.GetSectionPrivate = cand;
+					L.FindFile = find;
+					break;
+				}
+			}
+			if (L.GetSectionPrivate)
+				break;
+		}
 		if (!L.GetSectionPrivate)
 		{
-			log_warn("lua: GetSectionPrivate not found via "
-			         "nth_call_target");
+			log_warn(
+			    "lua: GetSectionPrivate unresolved (ConfigCoalesceFilter)");
 			return;
 		}
-		log_info("lua: GetSectionPrivate resolved = %p", L.GetSectionPrivate);
 
-		void *find = anchor::nth_call_target(img, L.GetSectionPrivate, 0);
-		if (!find || find == L.GetSectionPrivate)
-		{
-			log_warn("lua: FConfigCacheIni::Find not found "
-			         "(LoadAllClasses=%p GetSectionPrivate=%p)",
-			         L.LoadAllClasses, L.GetSectionPrivate);
-			return;
-		}
-		L.FindFile = find;
-		log_info("lua: Find=%p GetSectionPrivate=%p", L.FindFile,
-		         L.GetSectionPrivate);
+		void *getstring = nullptr;
+		static const wchar_t *bool_anchors[] = {L"On",  L"True", L"Yes",
+		                                        L"Yes", L"True", L"1"};
+		static const wchar_t *bool_not_anchors[] = {L"False"};
+		if (void *getbool = ue3_api::resolve_wstr_all_not(
+		        bool_anchors, 6, bool_not_anchors, 1, "GetBool"))
+			getstring = resolve_call_at(img, getbool, vtbl);
+		if (!in_mod(getstring))
+			getstring = nullptr;
+
+		log_info("lua: GetSectionPrivate=%p Find=%p GetString=%p",
+		         L.GetSectionPrivate, L.FindFile, getstring);
 	}
 
 	bool ensure_lua_hooks()
@@ -866,17 +924,20 @@ namespace
 		if (!L.Localize)
 			return false;
 
+		if (L.FindFile)
+			hook::add(L.FindFile, (void *)&find_file_detour, &g_orig_find_file);
+
+		if (L.GetSectionPrivate)
+			hook::add(L.GetSectionPrivate, (void *)&get_section_detour,
+			          &g_orig_get_section);
+
 		g_add = L.SectionAdd;
 		g_remove_key = L.SectionRemoveKey;
 		g_key_ctor = L.KeyCtor;
 		g_fname_keyed = L.fname_keyed;
 
-		if (L.FindFile)
-			hook::add(L.FindFile, (void *)&find_file_detour, &g_orig_find_file);
-		if (L.GetSectionPrivate)
-			hook::add(L.GetSectionPrivate, (void *)&get_section_detour,
-			          &g_orig_get_section);
 		hook::add(L.Localize, (void *)&localize_detour, &g_orig_localize);
+
 		hook::install_all();
 
 		ok = (g_orig_localize != nullptr);
@@ -906,7 +967,7 @@ namespace
 	{
 		if (!ensure_lua_hooks())
 			return false;
-		std::lock_guard<std::mutex> lk(g_loc_mtx);
+		LockGuard lk(g_loc_mtx);
 		if (sec_apply(op))
 			return true;
 		g_sec_pending.push_back(std::move(op));
@@ -1070,13 +1131,14 @@ namespace
 				    log_warn("lua: ue3.load — StaticLoadObject unresolved");
 				    return sol::nullopt;
 			    }
-			    using Fn = void *(__cdecl *)(void *, void *, const wchar_t *,
-			                                 const wchar_t *, uint32_t, void *,
-			                                 int32_t);
+			    static dx::CallConvInvoker<void *, void *, void *,
+			                               const wchar_t *, const wchar_t *,
+			                               uint32_t, void *, int32_t>
+			        Fn(slo);
+
 			    std::wstring w = to_wide(path);
-			    void *res = reinterpret_cast<Fn>(slo)(
-			        nullptr, outer.value_or(nullptr), w.c_str(), nullptr, 0,
-			        nullptr, 1);
+			    void *res = Fn(nullptr, outer.value_or(nullptr), w.c_str(),
+			                   nullptr, 0, nullptr, 1);
 			    if (!res)
 				    return sol::nullopt;
 			    return res;
@@ -1097,9 +1159,11 @@ namespace
 				    int32_t Index, Number;
 			    } out{0, 0};
 			    std::wstring w = to_wide(s);
-			    using Fn = void(UE3_THISCALL *)(void *, const wchar_t *, int,
-			                                    int, int);
-			    reinterpret_cast<Fn>(init)(&out, w.c_str(), 0, 1, 1);
+			    static dx::CallConvInvoker<void *, void *, const wchar_t *, int,
+			                               int, int>
+			        Fn(init);
+
+			    Fn(&out, w.c_str(), 0, 1, 1);
 			    return lua.create_table_with("index", out.Index, "number",
 			                                 out.Number);
 		    });
@@ -1185,7 +1249,7 @@ namespace
 				    std::wstring wk =
 				        loc_key(to_wide(package).c_str(),
 				                to_wide(section).c_str(), to_wide(key).c_str());
-				    std::lock_guard<std::mutex> lk(g_loc_mtx);
+				    LockGuard lk(g_loc_mtx);
 				    g_loc_overrides[wk] = to_wide(new_string);
 				    return true;
 			    });
@@ -1300,10 +1364,10 @@ namespace
 				const std::string leaf =
 				    (dot == std::string::npos) ? path : path.substr(dot + 1);
 				FNameStack nm{};
-				using InitFn = void(UE3_THISCALL *)(void *, const wchar_t *,
-				                                    int, int, int);
-				reinterpret_cast<InitFn>(init)(&nm, to_wide(leaf).c_str(), 0, 1,
-				                               1);
+				static dx::CallConvInvoker<void *, void *, const wchar_t *, int,
+				                           int, int>
+				    InitFn(init);
+				InitFn(&nm, to_wide(leaf).c_str(), 0, 1, 1);
 				return name_key(nm.Index, nm.Number);
 			};
 
@@ -1330,7 +1394,7 @@ namespace
 				    pw.fn = std::move(fn);
 				    pw.once = once.value_or(true);
 
-				    std::lock_guard<std::mutex> lk(g_preload_mtx);
+				    LockGuard lk(g_preload_mtx);
 				    g_preload_watch[key].push_back(std::move(pw));
 				    g_preload_live.fetch_add(1, std::memory_order_relaxed);
 				    if (verbose)
@@ -1356,7 +1420,7 @@ namespace
 				    const bool one_shot = once.value_or(true);
 				    int added = 0;
 
-				    std::lock_guard<std::mutex> lk(g_preload_mtx);
+				    LockGuard lk(g_preload_mtx);
 				    for (auto &kv : map)
 				    {
 					    if (kv.first.get_type() != sol::type::string)
@@ -1644,7 +1708,7 @@ namespace lua_host
 
 		std::vector<std::pair<sol::protected_function, sol::object>> to_run;
 		{
-			std::lock_guard<std::mutex> lk(g_preload_mtx);
+			LockGuard lk(g_preload_mtx);
 
 			auto it = g_preload_watch.find(key);
 			if (it == g_preload_watch.end())

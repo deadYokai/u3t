@@ -90,6 +90,7 @@ struct FNameLayout
 {
 	size_t str_off = 0;
 	bool with_flags = false;
+	bool always_wide = false;
 
 	int32_t raw_index(const void *e) const
 	{
@@ -97,9 +98,15 @@ struct FNameLayout
 		    ue3raw::rd_u32(e, with_flags ? sizeof(void *) : 0));
 	}
 
-	bool is_unicode(const void *e) const { return (raw_index(e) & 1) != 0; }
+	bool is_unicode(const void *e) const
+	{
+		return always_wide ? true : (raw_index(e) & 1) != 0;
+	}
 
-	int name_index(const void *e) const { return raw_index(e) >> 1; }
+	int name_index(const void *e) const
+	{
+		return always_wide ? raw_index(e) : (raw_index(e) >> 1);
+	}
 
 	const char *ansi(const void *e) const
 	{
@@ -125,6 +132,7 @@ struct UE3Layout
 	void *FNameInit = nullptr;
 	void *ArrayRealloc = nullptr;
 	void *StaticFindObjectFast = nullptr;
+	void *StaticFindObjectFastInternal = nullptr;
 	void *StaticLoadObject = nullptr;
 	void *GetPackageLinker = nullptr;
 	void *Preload = nullptr;

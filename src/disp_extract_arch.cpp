@@ -2,20 +2,14 @@
 #include <Zydis/Zydis.h>
 #include <cstdint>
 
+#include "decode.hpp"
+
 namespace dxa
 {
 	constexpr int64_t SENT = INT64_MIN;
 	const int PS = static_cast<int>(sizeof(void *));  // 4 or 8
 
-	ZydisDecoder make_decoder()
-	{
-		ZydisDecoder d;
-		ZydisDecoderInit(&d,
-		                 PS == 8 ? ZYDIS_MACHINE_MODE_LONG_64
-		                         : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 PS == 8 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
-		return d;
-	}
+	ZydisDecoder make_decoder() { return dx::native_decoder(); }
 
 	int gpr_idx(ZydisRegister reg)
 	{
@@ -42,6 +36,11 @@ namespace dxa
 	{
 		if (op.type != ZYDIS_OPERAND_TYPE_MEMORY)
 			return false;
+
+		if (op.mem.segment == ZYDIS_REGISTER_FS ||
+		    op.mem.segment == ZYDIS_REGISTER_GS)
+			return false;
+
 		if (op.mem.base == ZYDIS_REGISTER_RIP && op.mem.disp.has_displacement)
 		{
 			out = reinterpret_cast<void **>(
@@ -56,6 +55,8 @@ namespace dxa
 			                   ? static_cast<uintptr_t>(
 			                         static_cast<uint32_t>(op.mem.disp.value))
 			                   : static_cast<uintptr_t>(op.mem.disp.value);
+			if (!va)
+				return false;
 			out = reinterpret_cast<void **>(va);
 			return true;
 		}
@@ -293,6 +294,109 @@ namespace dxa
 				{
 					outv = static_cast<ptrdiff_t>(cf);
 					return true;
+				}
+			}
+
+			p += in.length;
+		}
+		return false;
+	}
+
+	bool serialize_vslot(const void *b, const void *e, ptrdiff_t &out_vtoff)
+	{
+		ZydisDecoder dec = make_decoder();
+		const uint8_t *p = static_cast<const uint8_t *>(b);
+		const uint8_t *end = static_cast<const uint8_t *>(e);
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+
+		int64_t vt_src[16];
+		int64_t fp_slot[16];
+		int64_t fp_src[16];
+		int ecx_obj = -1;
+
+		auto clr = [&](int r)
+		{
+			vt_src[r] = SENT;
+			fp_slot[r] = SENT;
+			fp_src[r] = SENT;
+		};
+		for (int i = 0; i < 16; ++i)
+			clr(i);
+
+		while (p < end)
+		{
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, end - p, &in, ops)))
+				break;
+
+			int64_t vt_prev[16], fps_prev[16], fpsrc_prev[16];
+			for (int i = 0; i < 16; ++i)
+			{
+				vt_prev[i] = vt_src[i];
+				fps_prev[i] = fp_slot[i];
+				fpsrc_prev[i] = fp_src[i];
+			}
+
+			if (in.mnemonic == ZYDIS_MNEMONIC_CALL &&
+			    in.operand_count_visible >= 1 &&
+			    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+			{
+				int rt = gpr_idx(ops[0].reg.value);
+				if (rt >= 0 && fp_slot[rt] != SENT && fp_src[rt] != SENT &&
+				    fp_src[rt] == ecx_obj)
+				{
+					out_vtoff = static_cast<ptrdiff_t>(fp_slot[rt]);
+					return true;
+				}
+			}
+
+			for (int i = 0; i < in.operand_count; ++i)
+				if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+				    (ops[i].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE))
+				{
+					int gi = gpr_idx(ops[i].reg.value);
+					if (gi >= 0)
+					{
+						clr(gi);
+						if (gi == 1)
+							ecx_obj = -1;
+					}
+				}
+
+			if (in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    in.operand_count_visible >= 2 &&
+			    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+			{
+				int dst = gpr_idx(ops[0].reg.value);
+
+				if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+				{
+					int src = gpr_idx(ops[1].reg.value);
+					if (dst == 1 && src >= 0)
+						ecx_obj = src;
+				}
+				else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+				         ops[1].mem.base != ZYDIS_REGISTER_NONE &&
+				         ops[1].mem.base != ZYDIS_REGISTER_RIP &&
+				         ops[1].mem.index == ZYDIS_REGISTER_NONE && dst >= 0)
+				{
+					int base = gpr_idx(ops[1].mem.base);
+					int64_t d = ops[1].mem.disp.has_displacement
+					                ? ops[1].mem.disp.value
+					                : 0;
+					if (base >= 0)
+					{
+						if (d == 0)
+						{
+							vt_src[dst] = base;
+						}
+						else if (vt_prev[base] != SENT && d > 0 &&
+						         (d % PS) == 0)
+						{
+							fp_slot[dst] = d;
+							fp_src[dst] = vt_prev[base];
+						}
+					}
 				}
 			}
 

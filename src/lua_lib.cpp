@@ -14,13 +14,14 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <windows.h>
+
+#include "mutex_wrapper.hpp"
 
 namespace
 {
@@ -302,7 +303,7 @@ namespace
 		std::unordered_map<std::string, Binding> binds;
 	};
 
-	std::mutex g_mtx;
+	Mutex g_mtx;
 	std::vector<std::shared_ptr<Lib>> g_libs;
 	std::unordered_map<std::string, std::pair<std::weak_ptr<Lib>, std::string>>
 	    g_flat;
@@ -648,7 +649,7 @@ namespace lua_lib
 			    lp->path = full;
 			    lp->mod = h;
 			    {
-				    std::lock_guard<std::mutex> lk(g_mtx);
+				    LockGuard lk(g_mtx);
 				    g_libs.push_back(lp);
 			    }
 			    log_info("lib: loaded %ls (base=%p)", full.c_str(), (void *)h);
@@ -730,7 +731,7 @@ namespace lua_lib
 				    }
 			    }
 
-			    std::lock_guard<std::mutex> lk(g_mtx);
+			    LockGuard lk(g_mtx);
 			    lp->binds[name] = b;
 			    g_flat[name] = {std::weak_ptr<Lib>(lp), name};
 			    log_info("lib: bound %s -> %p (%zu args)", name.c_str(), addr,
@@ -759,7 +760,7 @@ namespace lua_lib
 			    else
 			    {
 				    name = first.as<std::string>();
-				    std::lock_guard<std::mutex> lk(g_mtx);
+				    LockGuard lk(g_mtx);
 				    auto it = g_flat.find(name);
 				    if (it == g_flat.end())
 				    {
@@ -778,7 +779,7 @@ namespace lua_lib
 
 			    Binding b;
 			    {
-				    std::lock_guard<std::mutex> lk(g_mtx);
+				    LockGuard lk(g_mtx);
 				    auto it = lp->binds.find(name);
 				    if (it == lp->binds.end())
 				    {
@@ -798,7 +799,7 @@ namespace lua_lib
 		    {
 			    if (!lp || !lp->mod)
 				    return false;
-			    std::lock_guard<std::mutex> lk(g_mtx);
+			    LockGuard lk(g_mtx);
 			    for (auto it = g_flat.begin(); it != g_flat.end();)
 			    {
 				    auto owner = it->second.first.lock();
@@ -817,7 +818,7 @@ namespace lua_lib
 		                 [&lua]()
 		                 {
 			                 sol::table t = lua.create_table();
-			                 std::lock_guard<std::mutex> lk(g_mtx);
+			                 LockGuard lk(g_mtx);
 			                 int i = 1;
 			                 for (auto &l : g_libs)
 				                 t[i++] = to_narrow(l->path);
@@ -855,7 +856,7 @@ namespace lua_lib
 
 	void unload_all()
 	{
-		std::lock_guard<std::mutex> lk(g_mtx);
+		LockGuard lk(g_mtx);
 		g_flat.clear();
 		for (auto &l : g_libs)
 			if (l->mod)

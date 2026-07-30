@@ -16,8 +16,11 @@ namespace dx
 	bool nth_rip_global(const void *begin, const void *end, int n,
 	                    void **&out_global);
 
-	bool first_rip_global_noncookie(const void *begin, const void *end,
-	                                void **&out_global);
+	bool first_global_noncookie(const void *begin, const void *end,
+	                            void **&out_global);
+
+	std::vector<void *> neg_lea_sites(const void *begin, const void *end,
+	                                  int64_t disp);
 
 	std::vector<int> indirect_call_slots(const void *begin, const void *end);
 
@@ -41,10 +44,16 @@ namespace dx
 
 	bool has_fname_none_store(const void *begin, const void *end);
 
+	bool has_fname_none_compare(const void *begin, const void *end,
+	                            int64_t stride = 8, int window = 12);
+
 	void *call_feeding_global_store(const void *begin, const void *end,
 	                                void **global);
 
 	int x64_argnum_liveness(const void *begin, const void *end,
 	                        int max_insns = 32);
+
+	int call_stack_bytes(const void *call_site, const void *caller_end,
+	                     const void *callee_entry, const void *callee_end);
 
 }  // namespace dx

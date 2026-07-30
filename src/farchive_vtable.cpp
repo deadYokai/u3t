@@ -6,7 +6,10 @@
 #include <cstring>
 #include <vector>
 
+#include "decode.hpp"
+
 #include "asm_pat.hpp"
+#include "disp_extract.hpp"
 #include "disp_extract_arch.hpp"
 #include "logs.hpp"
 
@@ -14,17 +17,31 @@ namespace
 {
 	constexpr int PS = static_cast<int>(sizeof(void *));
 
-	ZydisDecoder mkdec()
-	{
-		ZydisDecoder d;
-		ZydisDecoderInit(&d,
-		                 PS == 8 ? ZYDIS_MACHINE_MODE_LONG_64
-		                         : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 PS == 8 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
-		return d;
-	}
+	ZydisDecoder mkdec() { return dx::native_decoder(); }
 
 	const uint8_t *u8(const void *p) { return static_cast<const uint8_t *>(p); }
+
+	const uint8_t *body_end_by_ret(const anchor::ModuleImage &img,
+	                               const void *fn, size_t cap = 0x200)
+	{
+		ZydisDecoder dec = mkdec();
+		const uint8_t *p = u8(fn);
+		const uint8_t *e = p + cap;
+		if (e > img.text + img.text_size)
+			e = img.text + img.text_size;
+
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+		while (p < e)
+		{
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, e - p, &in, ops)))
+				break;
+			p += in.length;
+			if (in.mnemonic == ZYDIS_MNEMONIC_RET)
+				return p;
+		}
+		return e;
+	}
 
 	int forwarder_slot(const void *fn, const void *fn_end,
 	                   ptrdiff_t loader_off_fa)
@@ -240,6 +257,51 @@ namespace
 		}
 		return -1;
 	}
+
+	bool accessor_field(const anchor::ModuleImage &img, const void *fn,
+	                    int32_t &off_out, bool &plain_out)
+	{
+		ZydisDecoder dec = mkdec();
+		const uint8_t *p = u8(fn);
+		const uint8_t *e = p + 24;
+		if (e > img.text + img.text_size)
+			e = img.text + img.text_size;
+
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+
+		if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, e - p, &in, ops)))
+			return false;
+		if (in.mnemonic != ZYDIS_MNEMONIC_MOV || in.operand_count_visible < 2)
+			return false;
+		if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		    ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY)
+			return false;
+		if (ops[1].mem.base == ZYDIS_REGISTER_NONE ||
+		    ops[1].mem.base == ZYDIS_REGISTER_RIP ||
+		    ops[1].mem.index != ZYDIS_REGISTER_NONE)
+			return false;
+
+		off_out = static_cast<int32_t>(
+		    ops[1].mem.disp.has_displacement ? ops[1].mem.disp.value : 0);
+		p += in.length;
+
+		for (int i = 0; i < 6 && p < e; ++i)
+		{
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, e - p, &in, ops)))
+				return false;
+			if (in.mnemonic == ZYDIS_MNEMONIC_RET)
+			{
+				plain_out = (i == 0);
+				return true;
+			}
+			if (in.mnemonic == ZYDIS_MNEMONIC_CALL ||
+			    in.mnemonic == ZYDIS_MNEMONIC_JMP)
+				return false;
+			p += in.length;
+		}
+		return false;
+	}
 }  // namespace
 
 bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
@@ -272,6 +334,7 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 
 	std::vector<ForwarderHit> fwd_hits;
 	int fname_op_self_slot = -1;
+	void *fname = fname_op;
 
 	if (vt_preload)
 	{
@@ -296,6 +359,24 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 
 			if (fname_op_self_slot < 0 && fname_op && fn == fname_op)
 				fname_op_self_slot = self_slot;
+
+			if (!fname && vt_preload)
+			{
+				const ptrdiff_t rel = (q - vt_preload) / PS;
+				if (rel >= 1 && rel <= 8)
+				{
+					auto *cand = const_cast<void *>(fn);
+					const uint8_t *fe = body_end_by_ret(img, fn, 0x200);
+					if (fe > u8(fn) && dx::has_fname_none_compare(fn, fe))
+					{
+						fname = cand;
+						fname_op_self_slot = self_slot;
+						log_info("farchive: operator<<(FName)=%p via "
+						         "NAME_None pattern (Preload%+d)",
+						         cand, (int)rel);
+					}
+				}
+			}
 
 			int k = forwarder_slot(fn, u8(fn) + 0x20, loader_off_fa);
 			if (k > 0)
@@ -384,15 +465,7 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 	int ge = find_get_error_slot(img, seek_impl, out.Seek, ar_is_error_off);
 	if (ge > 0)
 		out.GetError = ge;
-	else if (seek_impl && ar_is_error_off != 0)
-		log_warn("resolve: found ArIsError at offset 0x%X via Seek, but no "
-		         "matching 2-instruction accessor in its vtable — GetError "
-		         "not derived",
-		         (unsigned)ar_is_error_off);
-	else
-		log_warn("resolve: GetError not derived at runtime (couldn't locate "
-		         "ArIsError's write in seek_impl — is the 'SetFilePointer "
-		         "Failed' anchor resolving?)");
+
 
 	const bool core_ok = out.Serialize == 1 && out.Tell > 0 &&
 	                     out.Seek == out.Tell + 3 &&
@@ -404,15 +477,61 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 		out.TotalSize = out.Tell + 1;
 	}
 
+	if (out.GetError <= 0 && vt_preload && have_bias && ar_is_error_off != 0)
+	{
+		const uint8_t *lo = vt_preload - 24 * PS;
+		if (lo < img.base)
+			lo = img.base;
+		const uint8_t *hi = vt_preload + 24 * PS;
+		if (hi > img.base + img.size - PS)
+			hi = img.base + img.size - PS;
+
+		int plain_slot = -1, close_slot = -1;
+
+		for (const uint8_t *q = lo; q <= hi; q += PS)
+		{
+			uintptr_t fp = 0;
+			memcpy(&fp, q, PS);
+			auto *fn = reinterpret_cast<const void *>(fp);
+			if (fn < img.text || fn >= img.text + img.text_size)
+				continue;
+
+			int32_t off = 0;
+			bool plain = false;
+			if (!accessor_field(img, fn, off, plain))
+				continue;
+			if (off != ar_is_error_off)
+				continue;
+
+			const int slot = static_cast<int>((q - lo) / PS) + slot_bias;
+			if (plain && plain_slot < 0)
+				plain_slot = slot;
+			else if (!plain && close_slot < 0)
+				close_slot = slot;
+		}
+
+		if (plain_slot > 0)
+		{
+			out.GetError = plain_slot;
+			log_info("farchive: GetError=%d via ArIsError@0x%X accessor in "
+			         "the Preload-anchored vtable (Close=%d)",
+			         plain_slot, (unsigned)ar_is_error_off, close_slot);
+		}
+	}
+
+	if (out.GetError <= 0) {
+		log_err("resolve: GetError not derived");
+	}
+
 	if (out.SerializeName <= 0)
 	{
-		log_warn("resolve: falling back to SerializeName=6 (UNVERIFIED)");
+		log_err("resolve: falling back to SerializeName=6 (UNVERIFIED)");
 		out.SerializeName = 6;
 	}
 
 	if (out.GetError <= 0)
 	{
-		log_warn("resolve: falling back to GetError=21 (UNVERIFIED, known "
+		log_err("resolve: falling back to GetError=21 (UNVERIFIED, known "
 		         "wrong on at least one build — check the warnings above)");
 		out.GetError = 21;
 	}

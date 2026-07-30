@@ -3,32 +3,32 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "decode.hpp"
+
 #include "disp_extract_arch.hpp"
 
 #include "asm_pat.hpp"
 
 namespace dx
 {
+	using Dec = Decoder;
+
 	namespace
 	{
-		struct Dec
-		{
-			ZydisDecoder d;
-
-			Dec()
-			{
-				ZydisDecoderInit(&d,
-				                 sizeof(void *) == 8
-				                     ? ZYDIS_MACHINE_MODE_LONG_64
-				                     : ZYDIS_MACHINE_MODE_LEGACY_32,
-				                 sizeof(void *) == 8 ? ZYDIS_STACK_WIDTH_64
-				                                     : ZYDIS_STACK_WIDTH_32);
-			}
-		};
-
 		inline const uint8_t *u8(const void *p)
 		{
 			return reinterpret_cast<const uint8_t *>(p);
+		}
+
+		constexpr int64_t kSlot = static_cast<int64_t>(sizeof(void *));
+		constexpr int64_t kMaxSlots = 256;
+
+		inline bool slot_disp(int64_t d, int &out_slot)
+		{
+			if (d < 0 || (d % kSlot) != 0 || d >= kMaxSlots * kSlot)
+				return false;
+			out_slot = static_cast<int>(d / kSlot);
+			return true;
 		}
 	}  // namespace
 
@@ -117,9 +117,10 @@ namespace dx
 			    ops[0].mem.disp.has_displacement)
 			{
 				const int64_t d = ops[0].mem.disp.value;
-				if (d >= 0 && (d % 8) == 0 && d < 64 * 8)
+				int slot = 0;
+				if (slot_disp(d, slot))
 				{
-					out_slot = static_cast<int>(d / 8);
+					out_slot = slot;
 					const uint8_t *next = store_ip + store_len;
 					out_global = reinterpret_cast<void **>(
 					    const_cast<uint8_t *>(next) + store_disp);
@@ -160,8 +161,8 @@ namespace dx
 		return false;
 	}
 
-	bool first_rip_global_noncookie(const void *begin, const void *end,
-	                                void **&out_global)
+	bool first_global_noncookie(const void *begin, const void *end,
+	                            void **&out_global)
 	{
 		Dec dec;
 		const uint8_t *p = u8(begin), *e = u8(end);
@@ -171,13 +172,12 @@ namespace dx
 		{
 			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec.d, p, e - p, &in, ops)))
 				break;
+			void **g = nullptr;
 			if (is_mnemonic(in, {ZYDIS_MNEMONIC_MOV, ZYDIS_MNEMONIC_LEA}) &&
-			    in.operand_count_visible >= 2 && is_mem_rip(ops[1]))
+			    in.operand_count_visible >= 2 &&
+			    dxa::global_from_mem(in, ops[1], p, g))
 			{
 				const uint8_t *next = p + in.length;
-				void **g = reinterpret_cast<void **>(
-				    const_cast<uint8_t *>(next) +
-				    static_cast<int32_t>(ops[1].mem.disp.value));
 
 				ZydisDecodedInstruction in2;
 				ZydisDecodedOperand ops2[ZYDIS_MAX_OPERAND_COUNT];
@@ -186,8 +186,8 @@ namespace dx
 				    ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec.d, next, e - next,
 				                                        &in2, ops2)) &&
 				    in2.mnemonic == ZYDIS_MNEMONIC_XOR &&
-				    in2.operand_count_visible >= 2 &&
-				    is_reg(ops2[1], ZYDIS_REGISTER_RSP))
+				    in2.operand_count_visible >= 2 && is_reg(ops2[1]) &&
+				    dxa::gpr_idx(ops2[1].reg.value) == 4)
 					is_cookie = true;
 
 				if (!is_cookie)
@@ -199,6 +199,32 @@ namespace dx
 			p += in.length;
 		}
 		return false;
+	}
+
+	std::vector<void *> neg_lea_sites(const void *begin, const void *end,
+	                                  int64_t disp)
+	{
+		std::vector<void *> out;
+		Dec dec;
+		const uint8_t *p = u8(begin), *e = u8(end);
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+		while (p < e)
+		{
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec.d, p, e - p, &in, ops)))
+			{
+				++p;
+				continue;
+			}
+			if (in.mnemonic == ZYDIS_MNEMONIC_LEA &&
+			    in.operand_count_visible >= 2 && is_mem_reg(ops[1]) &&
+			    ops[1].mem.index == ZYDIS_REGISTER_NONE &&
+			    ops[1].mem.disp.has_displacement &&
+			    ops[1].mem.disp.value == -disp)
+				out.push_back(const_cast<uint8_t *>(p));
+			p += in.length;
+		}
+		return out;
 	}
 
 	std::vector<int> indirect_call_slots(const void *begin, const void *end)
@@ -217,8 +243,9 @@ namespace dx
 			    ops[0].mem.disp.has_displacement)
 			{
 				const int64_t d = ops[0].mem.disp.value;
-				if (d >= 0 && (d % 8) == 0 && d < 64 * 8)
-					out.push_back(static_cast<int>(d / 8));
+				int slot = 0;
+				if (slot_disp(d, slot))
+					out.push_back(slot);
 			}
 			p += in.length;
 		}
@@ -417,8 +444,9 @@ namespace dx
 			{
 				const int vbase = dxa::gpr_idx(ops[0].mem.base);
 				const int64_t d = ops[0].mem.disp.value;
-				if (vbase >= 0 && vt_field_disp[vbase] != NONE && d >= 0 &&
-				    (d % 8) == 0 && d / 8 == slot)
+				int got = 0;
+				if (vbase >= 0 && vt_field_disp[vbase] != NONE &&
+				    slot_disp(d, got) && got == slot)
 				{
 					out_disp = vt_field_disp[vbase];
 					return true;
@@ -634,6 +662,112 @@ namespace dx
 		return false;
 	}
 
+	bool has_fname_none_compare(const void *begin, const void *end,
+	                            int64_t stride, int window)
+	{
+		Dec dec;
+		const uint8_t *p = u8(begin), *e = u8(end);
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand op[ZYDIS_MAX_OPERAND_COUNT];
+
+		bool have_lo = false;
+		int lo_base = -1, lo_index = -1;
+		int alias = -1;
+		int since = 0;
+
+		auto reset = [&]
+		{
+			have_lo = false;
+			lo_base = lo_index = alias = -1;
+			since = 0;
+		};
+
+		auto cmp_zero = [&](int &b, int &idx, int64_t &sc, int64_t &disp,
+		                    int &bits) -> bool
+		{
+			if (in.mnemonic != ZYDIS_MNEMONIC_CMP ||
+			    in.operand_count_visible < 2)
+				return false;
+			if (op[0].type != ZYDIS_OPERAND_TYPE_MEMORY)
+				return false;
+			if (op[1].type != ZYDIS_OPERAND_TYPE_IMMEDIATE ||
+			    op[1].imm.value.u != 0)
+				return false;
+			if (op[0].mem.base == ZYDIS_REGISTER_NONE ||
+			    op[0].mem.base == ZYDIS_REGISTER_RIP)
+				return false;
+
+			b = dxa::gpr_idx(op[0].mem.base);
+			idx = op[0].mem.index == ZYDIS_REGISTER_NONE
+			          ? -1
+			          : dxa::gpr_idx(op[0].mem.index);
+			sc = op[0].mem.scale;
+			disp = op[0].mem.disp.has_displacement ? op[0].mem.disp.value : 0;
+			bits = op[0].size;
+			return b >= 0;
+		};
+
+		while (p < e)
+		{
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec.d, p, e - p, &in, op)))
+				break;
+
+			if (in.mnemonic == ZYDIS_MNEMONIC_CALL ||
+			    in.mnemonic == ZYDIS_MNEMONIC_RET ||
+			    in.mnemonic == ZYDIS_MNEMONIC_JMP)
+			{
+				reset();
+				p += in.length;
+				continue;
+			}
+
+			if (have_lo && ++since > window)
+				reset();
+
+			int b = -1, idx = -1, bits = 0;
+			int64_t sc = 0, disp = 0;
+
+			if (cmp_zero(b, idx, sc, disp, bits))
+			{
+				if (idx >= 0 && sc == stride && disp == 0 && bits == 64)
+					return true;
+
+				if (idx >= 0 && sc == stride && disp == 0 && bits == 32)
+				{
+					have_lo = true;
+					lo_base = b;
+					lo_index = idx;
+					alias = -1;
+					since = 0;
+					p += in.length;
+					continue;
+				}
+
+				if (have_lo && bits == 32 && disp == 4)
+				{
+					if (idx == lo_index && b == lo_base && sc == stride)
+						return true;
+					if (idx < 0 && alias >= 0 && b == alias)
+						return true;
+				}
+			}
+
+			if (have_lo && in.mnemonic == ZYDIS_MNEMONIC_LEA &&
+			    in.operand_count_visible >= 2 &&
+			    op[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    op[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			    op[1].mem.index != ZYDIS_REGISTER_NONE &&
+			    op[1].mem.scale == stride &&
+			    dxa::gpr_idx(op[1].mem.base) == lo_base &&
+			    dxa::gpr_idx(op[1].mem.index) == lo_index &&
+			    (!op[1].mem.disp.has_displacement || op[1].mem.disp.value == 0))
+				alias = dxa::gpr_idx(op[0].reg.value);
+
+			p += in.length;
+		}
+		return false;
+	}
+
 	void *call_feeding_global_store(const void *begin, const void *end,
 	                                void **global)
 	{
@@ -683,9 +817,7 @@ namespace dx
 		if (!begin || !end)
 			return 0;
 
-		ZydisDecoder dec;
-		ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64,
-		                 ZYDIS_STACK_WIDTH_64);
+		ZydisDecoder dec = native_decoder(true);
 
 		static constexpr int kArgReg[4] = {1 /*RCX*/, 2 /*RDX*/, 8 /*R8*/,
 		                                   9 /*R9*/};
@@ -761,5 +893,54 @@ namespace dx
 			if (live[a])
 				argnum = a + 1;
 		return argnum;
+	}
+
+	int call_stack_bytes(const void *call_site, const void *caller_end,
+	                     const void *callee_entry, const void *callee_end)
+	{
+		Dec dec;
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+
+		if (call_site && caller_end)
+		{
+			const uint8_t *p = u8(call_site), *e = u8(caller_end);
+			if (p < e && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec.d, p, e - p,
+			                                                 &in, ops)))
+			{
+				const uint8_t *q = p + in.length;
+				for (int i = 0; i < 3 && q < e; ++i)
+				{
+					if (ZYAN_FAILED(
+					        ZydisDecoderDecodeFull(&dec.d, q, e - q, &in, ops)))
+						break;
+					if (in.mnemonic == ZYDIS_MNEMONIC_ADD &&
+					    in.operand_count_visible >= 2 && is_reg(ops[0]) &&
+					    dxa::gpr_idx(ops[0].reg.value) == 4 /* ESP */ &&
+					    is_imm(ops[1]))
+						return static_cast<int>(ops[1].imm.value.s);
+					if (is_flow_break(in))
+						break;
+					q += in.length;
+				}
+			}
+		}
+
+		if (callee_entry && callee_end)
+		{
+			const uint8_t *p = u8(callee_entry), *e = u8(callee_end);
+			while (p < e)
+			{
+				if (ZYAN_FAILED(
+				        ZydisDecoderDecodeFull(&dec.d, p, e - p, &in, ops)))
+					break;
+				if (in.mnemonic == ZYDIS_MNEMONIC_RET)
+					return (in.operand_count_visible >= 1 && is_imm(ops[0]))
+					           ? static_cast<int>(ops[0].imm.value.u)
+					           : 0;
+				p += in.length;
+			}
+		}
+		return -1;
 	}
 }  // namespace dx

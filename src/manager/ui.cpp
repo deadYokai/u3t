@@ -311,7 +311,7 @@ namespace ui
 		const std::vector<LoadedMod> &mods = mod_loader::loaded_mods();
 
 		gl_ctx::Window win;
-		if (!gl_ctx::create(win, L"CU3ML Manager", 720, 1024))
+		if (!gl_ctx::create(win, L"CU3ML Manager", 540, 768))
 		{
 			log_err("manager_ui: window/context creation failed - "
 			        "continuing boot");

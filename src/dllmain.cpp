@@ -16,6 +16,8 @@
 #include <unknwn.h>
 #include <windows.h>
 
+#include <tlhelp32.h>
+
 static HMODULE g_sys_di8 = nullptr;
 static FARPROC g_real_di8 = nullptr;
 static HMODULE g_hmod = nullptr;
@@ -178,24 +180,6 @@ bool cmdline_get_value(const wchar_t *name, std::wstring &out)
 
 static int __fastcall engine_loop_init(void *this_ptr)
 {
-
-	if (cmdline_has_switch(L"cu3ml-manager") ||
-	    loader_config::settings().manager_at_start)
-	{
-		log_info("engine_loop_init: manager requested — halting boot");
-
-		ui::Result r = ui::run();
-		if (r == ui::Result::Quit)
-		{
-			log_info("engine_loop_init: manager requested exit");
-			hook::remove_all();
-			ExitProcess(0);
-		}
-
-		mod_loader::refresh();
-		log_info("engine_loop_init: manager requested launch — resuming");
-	}
-
 	log_info("engine_loop_init: GEngineLoop::Init reached — resolving "
 	         "UE3 layout");
 
@@ -289,6 +273,153 @@ static bool install_engine_loop_init_hook()
 	return g_orig_engine_loop_init != nullptr;
 }
 
+using GuardedMainFn = int (*)(wchar_t *, HINSTANCE, HINSTANCE, int);
+
+static GuardedMainFn orig_guardmain = nullptr;
+
+static int hook_guardmain(wchar_t *CmdLine, HINSTANCE hInstance,
+                          HINSTANCE hPrevInstance, int nCmdShow)
+{
+	if (cmdline_has_switch(L"cu3ml-manager") ||
+	    loader_config::settings().manager_at_start)
+	{
+		log_info("GuardMain: manager requested — halting boot");
+
+		ui::Result r = ui::run();
+
+		if (r == ui::Result::Quit)
+		{
+			log_info("GuardMain: manager requested exit");
+			hook::remove_all();
+			ExitProcess(0);
+		}
+
+		mod_loader::refresh();
+		log_info("GuardMain: manager requested launch — resuming");
+	}
+
+	return orig_guardmain(CmdLine, hInstance, hPrevInstance, nCmdShow);
+}
+
+using warnf_t = void(__cdecl *)(void *, const wchar_t *, ...);
+warnf_t o_warnf = nullptr;
+
+using exception_t = void(__cdecl *)(const wchar_t *Fmt, ...);
+exception_t o_exeption = nullptr;
+
+void hk_warnf(void *Out, const wchar_t *Fmt, ...)
+{
+	wchar_t msg[4096];
+	msg[0] = L'\0';
+	if (Fmt)
+	{
+		va_list args;
+		va_start(args, Fmt);
+		_vsnwprintf(msg, _countof(msg) - 1, Fmt, args);
+		va_end(args);
+		msg[_countof(msg) - 1] = L'\0';
+	}
+
+	char msgA[4096];
+	WideCharToMultiByte(CP_UTF8, 0, msg, -1, msgA, sizeof(msgA), nullptr,
+	                    nullptr);
+	msgA[sizeof(msgA) - 1] = '\0';
+
+	log_engine("%s", msgA);
+
+	if (o_warnf)
+		o_warnf(Out, L"%s", msg);
+}
+
+void __cdecl hk_exeption(const wchar_t *Fmt, ...)
+{
+	wchar_t msg[4096];
+	msg[0] = L'\0';
+
+	if (Fmt)
+	{
+		va_list args;
+		va_start(args, Fmt);
+		_vsnwprintf(msg, _countof(msg) - 1, Fmt, args);
+		va_end(args);
+		msg[_countof(msg) - 1] = L'\0';
+	}
+
+	char msgA[4096];
+	WideCharToMultiByte(CP_UTF8, 0, msg, -1, msgA, sizeof(msgA), nullptr,
+	                    nullptr);
+	msgA[sizeof(msgA) - 1] = '\0';
+
+	log_fatal("%s", msgA);
+
+	if (o_exeption)
+		o_exeption(L"%s", msg);
+}
+
+static void guardmain()
+{
+
+	void *target = nullptr;
+
+	if (!(addr_cache::get_ptr("core.GuardMain", target) && target))
+	{
+		anchor::ModuleImage img = anchor::image_of(nullptr);
+		if (!img.ok)
+			return;
+
+		target = ue3_api::resolve_wstr(L"PC\\Splash.bmp", "GuardMain");
+		if (!target)
+			return;
+		addr_cache::put_ptr("core.GuardMain", target);
+		addr_cache::save();
+	}
+
+	void *warnf = nullptr;
+
+	if (!(addr_cache::get_ptr("core.EngineLog", warnf) && warnf))
+	{
+
+		warnf = ue3_api::resolve_wstr_callee(
+		    L"Assertion failed: %s [File:%s] [Line: %i]\n%s\nStack: %s",
+		    "Warnf");
+
+		if (!warnf)
+			return;
+
+		addr_cache::put_ptr("core.EngineLog", warnf);
+		addr_cache::save();
+	}
+
+	void *execption = nullptr;
+
+	if (!(addr_cache::get_ptr("core.EngineException", execption) && execption))
+	{
+		execption = ue3_api::resolve_wstr_callee(
+		    L"Script patch attempting to add new export (%i) which matches an "
+		    L"existing export (%i): %s",
+		    "execption");
+
+		if (!execption)
+			return;
+
+		addr_cache::put_ptr("core.EngineException", execption);
+		addr_cache::save();
+	}
+
+	if (execption)
+		hook::add(execption, reinterpret_cast<void *>(&hk_exeption),
+		          reinterpret_cast<void **>(&o_exeption));
+
+	if (warnf)
+		hook::add(warnf, reinterpret_cast<void *>(&hk_warnf),
+		          reinterpret_cast<void **>(&o_warnf));
+	if (target)
+		hook::add(target, reinterpret_cast<void *>(&hook_guardmain),
+		          reinterpret_cast<void **>(&orig_guardmain));
+
+	hook::install_all();
+}
+
 static DWORD WINAPI init_thread(LPVOID)
 {
 	logs::init();
@@ -304,6 +435,8 @@ static DWORD WINAPI init_thread(LPVOID)
 	         st.wHour, st.wMinute, st.wSecond);
 
 	log_info("module = %p", static_cast<void *>(g_hmod));
+
+	guardmain();
 
 	lua_host::configure_from_cmdline();
 

@@ -45,10 +45,36 @@ namespace anchor
 	bool function_calls(const ModuleImage &img, void *entry,
 	                    const void *target);
 
+	uint8_t *branch_target(const ModuleImage &img, const void *site);
+	uint8_t *resolve_thunk(const ModuleImage &img, void *fn, int max_hops = 8);
+	void *call_target(const ModuleImage &img, const void *site,
+	                  int max_hops = 8);
+
 	void *nth_call_target(const ModuleImage &img, void *entry, int n);
+
+	struct CallSite
+	{
+		uint8_t *site;
+		uint8_t *target;
+	};
+
+	std::vector<CallSite> call_sites(const ModuleImage &img, void *entry,
+	                                 bool accept_jmp = false);
 
 	std::vector<void *> direct_callers(const ModuleImage &img,
 	                                   const void *target);
+
+	std::vector<void *> direct_call_sites(const ModuleImage &img,
+	                                      const void *target);
+
+	void *function_start_heuristic(const ModuleImage &img, const void *interior,
+	                               size_t max_back = 0x4000);
+
+	void *function_start_heuristic(const void *interior,
+	                               size_t max_back = 0x4000);
+
+	void *callee_after_ref(const ModuleImage &img, const void *site,
+	                       size_t max_scan = 0x40);
 
 	void reset_xref_index();
 }  // namespace anchor

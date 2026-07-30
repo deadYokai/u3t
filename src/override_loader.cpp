@@ -1,11 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
-#include "override_loader.hpp"
-#include "hook.hpp"
-#include "logs.hpp"
-#include "ue3_api.hpp"
-#include "ue3_layout.hpp"
-#include "ue3_patch.hpp"
-#include "util.hpp"
+#include <windows.h>
+
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -14,7 +9,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include <windows.h>
+#include "hook.hpp"
+#include "logs.hpp"
+#include "override_loader.hpp"
+#include "ue3_api.hpp"
+#include "ue3_layout.hpp"
+#include "ue3_patch.hpp"
+#include "util.hpp"
+
+#include "callconv.hpp"
 
 #include "lua_host.hpp"
 
@@ -179,7 +182,7 @@ struct FNamePatchCtx
 
 static thread_local std::vector<FNamePatchCtx> tl_fn_stack;
 
-static void *__fastcall fname_remap_thunk(void *fa, UE3_EDX void *fname_out)
+static void *fname_remap_thunk(void *fa, void *fname_out)
 {
 	if (tl_fn_stack.empty())
 	{
@@ -193,8 +196,8 @@ static void *__fastcall fname_remap_thunk(void *fa, UE3_EDX void *fname_out)
 		void *cur = *linker_loader_ptr(lb);
 		if (cur != ctx.active_br)
 		{
-			using FnT = void *(UE3_THISCALL *)(void *, void *);
-			return reinterpret_cast<FnT>(ctx.orig_fn)(fa, fname_out);
+			static dx::CallConvInvoker<void *, void *, void *> FnT(ctx.orig_fn);
+			return FnT(fa, fname_out);
 		}
 	}
 
@@ -359,18 +362,17 @@ static void build_name_remap(override_loader::OverrideRecord &rec, void *linker)
 	log_info("override: build_name_remap '%ls' nm=%p Num=%d", rec.key.c_str(),
 	         (void *)nm.data, nm.num);
 
-	using FNameInitFn = void(UE3_THISCALL *)(void *self, const wchar_t *InName,
-	                                         int32_t InNumber, int32_t FindType,
-	                                         int32_t bSplitName);
-
-	auto fni = reinterpret_cast<FNameInitFn>(ue3().FNameInit);
-	if (!fni)
+	if (!ue3().FNameInit)
 	{
 		log_warn("override: build_name_remap '%ls' — FNameInit unresolved",
 		         rec.key.c_str());
 		rec.name_remap.clear();
 		return;
 	}
+
+	static dx::CallConvInvoker<void *, void *, const wchar_t *, int32_t,
+	                           int32_t, int32_t>
+	    fni(ue3().FNameInit);
 
 	rec.name_remap.assign(rec.tool_names.size(), 0);
 	for (size_t ti = 0; ti < rec.tool_names.size(); ++ti)
@@ -446,10 +448,9 @@ static void call_object_serialize(void *obj, void *linker)
 		*ue3().GSerializedObject = obj;
 	}
 
-	using SerializeFn = void(UE3_THISCALL *)(void *, void *);
 	void **vt = *static_cast<void ***>(obj);
-	auto serialize = reinterpret_cast<SerializeFn>(vt[slot]);
-	serialize(obj, farchive);
+	using SerializeFn = void(UE3_THISCALL *)(void *, void *);
+	reinterpret_cast<SerializeFn>(vt[slot])(obj, farchive);
 
 	if (ue3().GSerializedObject)
 		*ue3().GSerializedObject = prev_serial;
@@ -781,11 +782,13 @@ static void parse_newexports(const std::wstring &file,
 
 static bool make_object_fname(const std::wstring &leaf, FNameStack &out)
 {
-	using FNameInitFn = void(UE3_THISCALL *)(void *, const wchar_t *, int32_t,
-	                                         int32_t, int32_t);
-	auto fni = reinterpret_cast<FNameInitFn>(ue3().FNameInit);
-	if (!fni)
+	if (!ue3().FNameInit)
 		return false;
+
+	static dx::CallConvInvoker<void *, void *, const wchar_t *, int32_t,
+	                           int32_t, int32_t>
+	    fni(ue3().FNameInit);
+
 	out = FNameStack{};
 	fni(&out, leaf.c_str(), 0, 1, 1);
 	return true;

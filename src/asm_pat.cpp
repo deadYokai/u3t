@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "decode.hpp"
+
 namespace asmpat
 {
 	namespace
@@ -222,12 +224,7 @@ namespace asmpat
 	{
 		AsmFindPat m(watch, breaks, target, window, on_fail);
 
-		ZydisDecoder dec;
-		ZydisDecoderInit(&dec,
-		                 sizeof(void *) == 8 ? ZYDIS_MACHINE_MODE_LONG_64
-		                                     : ZYDIS_MACHINE_MODE_LEGACY_32,
-		                 sizeof(void *) == 8 ? ZYDIS_STACK_WIDTH_64
-		                                     : ZYDIS_STACK_WIDTH_32);
+		ZydisDecoder dec = dx::native_decoder();
 
 		const uint8_t *b = static_cast<const uint8_t *>(begin);
 		const uint8_t *e = static_cast<const uint8_t *>(end);

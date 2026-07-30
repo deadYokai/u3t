@@ -1,9 +1,17 @@
 #pragma once
+#include "Zydis/DecoderTypes.h"
 #include "Zydis/Register.h"
 #include <cstddef>
+#include <cstdint>
 
 namespace dxa
 {
+	constexpr int kPS = static_cast<int>(sizeof(void *));
+
+	bool global_from_mem(const ZydisDecodedInstruction &in,
+	                     const ZydisDecodedOperand &op, const uint8_t *ip,
+	                     void **&out);
+
 	bool serialized_object_and_serialize(const void *begin, const void *end,
 	                                     void **&out_global,
 	                                     ptrdiff_t &out_vtoff, int window = 10);
@@ -19,6 +27,9 @@ namespace dxa
 
 	bool load_and_indexed_store_to_global(const void *b, const void *e,
 	                                      void **global_ptr, int scale);
+
+	bool serialize_vslot(const void *begin, const void *end,
+	                     ptrdiff_t &out_vtoff);
 
 	int gpr_idx(ZydisRegister reg);
 

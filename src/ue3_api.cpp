@@ -169,12 +169,6 @@ namespace ue3_api
 				         "exclusion(s))",
 				         label, fn, count,
 				         mode == MatchMode::All ? "all" : "any", not_count);
-			else
-				log_warn("ue3_api: '%s' - %zu candidate(s) after %s over %d "
-				         "anchor(s) and %d exclusion(s)",
-				         label, cur.size(),
-				         mode == MatchMode::All ? "intersecting" : "scanning",
-				         count, not_count);
 
 			g_result_cache.emplace(std::move(key), fn);
 			return fn;
@@ -230,6 +224,34 @@ namespace ue3_api
 	{
 		return resolve_wstr_ex(needles, count, nots, not_count, MatchMode::All,
 		                       label);
+	}
+
+	void *resolve_wstr_callee(const wchar_t *needle, const char *label)
+	{
+		if (!needle)
+			return nullptr;
+
+		anchor::ModuleImage img = anchor::image_of(nullptr);
+		if (!img.ok)
+		{
+			log_warn("ue3_api: bad PE image resolving '%s'", label);
+			return nullptr;
+		}
+
+		std::vector<void *> callees;
+		for (const void *s : anchor::find_wstr_all(img, needle))
+			for (void *site : anchor::find_refs(img, s))
+				if (void *c = anchor::callee_after_ref(img, site))
+					callees.push_back(c);
+
+		std::sort(callees.begin(), callees.end());
+		callees.erase(std::unique(callees.begin(), callees.end()),
+		              callees.end());
+
+		void *fn = anchor::only(callees, label);
+		if (fn)
+			log_info("ue3_api: resolved '%s' = %p (string-callee)", label, fn);
+		return fn;
 	}
 
 	void *resolve_cstr(const char *needle, const char *label)

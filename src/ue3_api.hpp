@@ -17,9 +17,13 @@
 #ifdef _WIN64
 #define UE3_EDX
 #define UE3_EDX_ARG
+#define UE3_EDX_NULL
+#define UE3_EDX_ARG_2
 #else
 #define UE3_EDX void *,
-#define UE3_EDX_ARG *,
+#define UE3_EDX_ARG void *edx,
+#define UE3_EDX_NULL nullptr,
+#define UE3_EDX_ARG_2 edx,
 #endif
 
 namespace ue3_api
@@ -53,6 +57,8 @@ namespace ue3_api
 	void *resolve_wstr_all_not(const wchar_t *const *needles, int count,
 	                           const wchar_t *const *nots, int not_count,
 	                           const char *label);
+
+	void *resolve_wstr_callee(const wchar_t *needle, const char *label);
 
 	void *resolve_cstr(const char *needle, const char *label);
 

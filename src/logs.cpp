@@ -52,9 +52,24 @@ namespace logs
 
 	void write_line(const char *level, const char *msg)
 	{
-		char line[4096];
-		snprintf(line, sizeof(line), "[%s] %s\n", level, msg);
-		raw_write(line);
+		char buffer[4096];
+		const char *start = msg;
+		const char *end;
+
+		while ((end = strchr(start, '\n')) != NULL)
+		{
+			size_t len = end - start;
+			snprintf(buffer, sizeof(buffer), "[%s] %.*s\n", level, (int)len,
+			         start);
+			raw_write(buffer);
+			start = end + 1;
+		}
+
+		if (*start != '\0')
+		{
+			snprintf(buffer, sizeof(buffer), "[%s] %s\n", level, start);
+			raw_write(buffer);
+		}
 	}
 
 	static int format_guarded(char *buf, size_t cap, const char *fmt,

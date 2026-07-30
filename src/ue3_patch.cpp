@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "callconv.hpp"
+
 #include "logs.hpp"
 
 namespace
@@ -18,16 +20,16 @@ namespace
 			return nullptr;
 		if (PS == 8)
 		{
-			using Fn = void *(*)(void *, uint32_t, uint32_t);
-			return reinterpret_cast<Fn>(L.ArrayRealloc)(data, old_bytes,
-			                                            new_bytes);
+			dx::CallConvInvoker<void *, void *, uint32_t, uint32_t> Fn(
+			    L.ArrayRealloc);
+			return Fn(data, old_bytes, new_bytes);
 		}
 		else
 		{
 			// x86 appRealloc(Original, NewBytes, Alignment)
-			using Fn = void *(*)(void *, uint32_t, uint32_t);
-			return reinterpret_cast<Fn>(L.ArrayRealloc)(data, new_bytes,
-			                                            /*align*/ 8);
+			dx::CallConvInvoker<void *, void *, uint32_t, uint32_t> Fn(
+			    L.ArrayRealloc);
+			return Fn(data, new_bytes, 8);
 		}
 	}
 
