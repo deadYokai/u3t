@@ -30,8 +30,10 @@
 
 #include "lua_lib.hpp"
 
-#include "manager/msg_box.hpp"
 #include "mutex_wrapper.hpp"
+
+#include "ui/msg_box.hpp"
+#include "ui/overlay/overlay.hpp"
 
 #include "callconv.hpp"
 
@@ -248,19 +250,17 @@ namespace
 
 	void build_eng_fstring(EngFString *out, const std::wstring &s)
 	{
+		log_debug("call -> build_eng_fstring(out=%p, s=%ls)", out, s.c_str());
 		out->Data = nullptr;
 		out->Num = 0;
 		out->Max = 0;
 		if (s.empty())
 			return;
-		void *ra = ue3().ArrayRealloc;
-		if (!ra)
-			return;
 		unsigned bytes = (unsigned)((s.size() + 1) * sizeof(wchar_t));
-		static dx::CallConvInvoker<void *, void *, unsigned, unsigned> Fn(ra, dx::CallConv::Thiscall);
 
-		void *data = (sizeof(void *) == 8) ? Fn(nullptr, 0, bytes)
-		                                   : Fn(nullptr, bytes, 8);
+		void *data = (sizeof(void *) == 8)
+		                 ? ue3_api::game_realloc(nullptr, 0, bytes)
+		                 : ue3_api::game_realloc(nullptr, bytes, 8);
 		if (!data)
 			return;
 		memcpy(data, s.c_str(), s.size() * sizeof(wchar_t));
@@ -283,6 +283,9 @@ namespace
 		size_t lastDot = result.find_last_of(L'.');
 		if (lastDot != std::wstring::npos)
 			result.erase(lastDot);
+
+		log_debug("ret -> package_from_filename(Filename=%ls) ; Result=%ls",
+		          filename, result.c_str());
 
 		return result;
 	}
@@ -538,17 +541,22 @@ namespace
 	void *cfg_section(const wchar_t *Section, const wchar_t *Filename,
 	                  bool create)
 	{
+		log_debug("call -> cfg_section(Section=%ls, Filename=%ls, create=%i)",
+		          Section, Filename, create);
 		void *self = cfg_self();
 		if (!self || !g_orig_get_section || !Section || !Filename)
 			return nullptr;
 
-		static dx::CallConvInvoker<void *, void *, UE3_EDX const wchar_t *, int,
-		                           int, const wchar_t *>
+		static dx::CallConvInvoker<void *, void *, const wchar_t *, int, int,
+		                           const wchar_t *>
 		    fn(g_orig_get_section, dx::CallConv::Thiscall);
-
-		void *Sec = fn(self, UE3_EDX_NULL Section, 0, 1, Filename);
+		void *Sec = fn(cfg_self(), Section, 0, 1, Filename);
 		if (!Sec && create)
-			Sec = fn(self, UE3_EDX_NULL Section, 1, 0, Filename);
+			Sec = fn(cfg_self(), Section, 1, 0, Filename);
+		log_debug(
+		    "ret -> cfg_section(Section=%ls, Filename=%ls, create=%i) ; Sec=%p",
+		    Section, Filename, create, Sec);
+
 		return Sec;
 	}
 
@@ -646,19 +654,27 @@ namespace
 		g_sec_pending.swap(keep);
 	}
 
-	void *__fastcall get_section_detour(void *self,
-	                                    UE3_EDX_ARG const wchar_t *Section,
-	                                    int Force, int Const,
-	                                    const wchar_t *Filename)
+	void *UE3_FASTCALL get_section_detour(void *self,
+	                                      UE3_EDX_ARG const wchar_t *Section,
+	                                      int Force, int Const,
+	                                      const wchar_t *Filename)
 	{
-		if (!g_gconfig && self)
+		if (!g_gconfig)
 			g_gconfig = self;
+
+		log_debug("call -> get_section_detour(Section=%ls, Force=%i, Const=%i, "
+		          "Filename=%ls) ; GConfig=%p",
+		          Section, Force, Const, Filename, g_gconfig);
 
 		static dx::CallConvInvoker<void *, void *, const wchar_t *, int, int,
 		                           const wchar_t *>
 		    orig(g_orig_get_section, dx::CallConv::Thiscall);
 
 		void *Sec = orig(self, Section, Force, Const, Filename);
+		log_debug(
+		    "call -> UE3::GetSectionPrivate(Section=%ls, Force=%i, Const=%i, "
+		    "Filename=%ls) ; Return=%p",
+		    Section, Force, Const, Filename, Sec);
 
 		std::wstring pkg = package_from_filename(Filename);
 		LockGuard lk(g_loc_mtx);
@@ -704,9 +720,14 @@ namespace
 		return Sec;
 	}
 
-	void *localize_detour(void *ret, const wchar_t *Section, const wchar_t *Key,
-	                      const wchar_t *Package, const wchar_t *Lang, int bOpt)
+	void *__cdecl localize_detour(void *ret, const wchar_t *Section,
+	                              const wchar_t *Key, const wchar_t *Package,
+	                              const wchar_t *Lang, int bOpt)
 	{
+		log_debug("call -> localize_detour(ret=%p, Section=%ls, Key=%ls, "
+		          "Package=%ls, Lang=%ls, bOpt=%i)",
+		          ret, Section, Key, Package, Lang, bOpt);
+
 		if (Section && Key && Package)
 		{
 			std::wstring v;
@@ -736,14 +757,21 @@ namespace
 
 	static void *g_orig_find_file = nullptr;
 
-	void *__fastcall find_file_detour(void *self,
-	                                  UE3_EDX_ARG const wchar_t *Filename,
-	                                  int CreateIfNotFound)
+	void *UE3_FASTCALL find_file_detour(void *self,
+	                                    UE3_EDX_ARG const wchar_t *Filename,
+	                                    int CreateIfNotFound)
 	{
+		log_debug("call -> find_file_detour(self=%p, Filename=%ls, "
+		          "CreateIfNotFound=%i)",
+		          self, Filename, CreateIfNotFound);
+
 		static dx::CallConvInvoker<void *, void *, const wchar_t *, int> orig(
 		    g_orig_find_file, dx::CallConv::Thiscall);
 
 		void *File = orig(self, Filename, CreateIfNotFound);
+		log_debug("call -> UE3::FindFile(self=%p, Filename=%ls, "
+		          "CreateIfNotFound=%i) ; File=%p",
+		          self, Filename, CreateIfNotFound, File);
 
 		if (!g_gconfig && self)
 			g_gconfig = self;
@@ -774,6 +802,8 @@ namespace
 	static void *resolve_call_at(const anchor::ModuleImage &img,
 	                             const void *from, void **gconfig_vtbl)
 	{
+		log_debug("call -> resolve_call_at(from=%p, from=%p, gconfig_vtbl=%p)",
+		          img, from, gconfig_vtbl);
 		void *entry = anchor::function_entry(img, from);
 		if (!entry)
 			entry = const_cast<void *>(from);
@@ -816,7 +846,7 @@ namespace
 			log_warn("lua: Localize not resolved");
 			return;
 		}
-
+		log_debug("resolve_lua_addrs -> L.Localize=%p", L.Localize);
 		static const wchar_t *sec_kAnchors[] = {L"UnrealEd.EditorEngine",
 		                                        L"Editor.EditorEngine"};
 		L.LoadAllClasses =
@@ -826,6 +856,7 @@ namespace
 			log_warn("lua: LoadAllClasses anchor not found");
 			return;
 		}
+		log_debug("resolve_lua_addrs -> L.LoadAllClasses=%p", L.LoadAllClasses);
 
 		anchor::ModuleImage img = anchor::image_of(nullptr);
 		if (!img.ok)
@@ -851,6 +882,7 @@ namespace
 		}
 
 		void *gconfig = cfg_self();
+		log_debug("lua_host::init gconfig");
 		if (!gconfig)
 		{
 			log_warn("lua: GConfig not live yet - section hooks deferred");
@@ -858,6 +890,7 @@ namespace
 		}
 
 		void **vtbl = *reinterpret_cast<void ***>(gconfig);
+		log_debug("lua_host::init gconfig vtable %p", vtbl);
 		auto in_mod = [&](void *p)
 		{ return p && p >= img.base && p < img.base + img.size; };
 
@@ -866,16 +899,22 @@ namespace
 		for (const void *s :
 		     anchor::find_wstr_all(img, L"ConfigCoalesceFilter"))
 		{
+			log_debug("checking `configcoalescefilter`");
 			for (void *site : anchor::find_refs(img, s))
 			{
 				void *cand = resolve_call_at(img, site, vtbl);
 				if (!in_mod(cand))
 					continue;
 				void *find = anchor::nth_call_target(img, cand, 0);
+				log_debug("ConfigCoalesceFilter -> nth_call_targer return: %p",
+				          find);
 				if (in_mod(find) && find != cand)
 				{
 					L.GetSectionPrivate = cand;
+					log_debug("resolve_lua_addrs -> L.GetSectionPrivate=%p",
+					          L.GetSectionPrivate);
 					L.FindFile = find;
+					log_debug("resolve_lua_addrs -> L.FindFile=%p", L.FindFile);
 					break;
 				}
 			}
@@ -1161,7 +1200,7 @@ namespace
 			    std::wstring w = to_wide(s);
 			    static dx::CallConvInvoker<void *, void *, const wchar_t *, int,
 			                               int, int>
-			        Fn(init);
+			        Fn(init, dx::CallConv::Thiscall);
 
 			    Fn(&out, w.c_str(), 0, 1, 1);
 			    return lua.create_table_with("index", out.Index, "number",
@@ -1366,7 +1405,7 @@ namespace
 				FNameStack nm{};
 				static dx::CallConvInvoker<void *, void *, const wchar_t *, int,
 				                           int, int>
-				    InitFn(init);
+				    InitFn(init, dx::CallConv::Thiscall);
 				InitFn(&nm, to_wide(leaf).c_str(), 0, 1, 1);
 				return name_key(nm.Index, nm.Number);
 			};
@@ -1444,6 +1483,8 @@ namespace
 				    return added;
 			    });
 		}
+
+		overlay::bind_lua(lua);
 
 		lua_lib::bind(lua);
 

@@ -16,6 +16,9 @@ namespace dx
 	bool nth_rip_global(const void *begin, const void *end, int n,
 	                    void **&out_global);
 
+	bool first_global_this(const void *begin, const void *end,
+	                       void **&out_global);
+
 	bool first_global_noncookie(const void *begin, const void *end,
 	                            void **&out_global);
 

@@ -2,8 +2,8 @@
 #include "ui.hpp"
 
 #include "crt_post.hpp"
-#include "gl_ctx.hpp"
-#include "theme.hpp"
+#include "ui/gl_ctx.hpp"
+#include "ui/theme.hpp"
 
 #include "loader_config.hpp"
 #include "logs.hpp"

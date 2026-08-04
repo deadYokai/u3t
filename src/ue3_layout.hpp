@@ -129,6 +129,9 @@ struct TArrayView
 
 struct UE3Layout
 {
+	void **GMalloc = nullptr;
+	void *GCreateMalloc = nullptr;
+
 	void *FNameInit = nullptr;
 	void *ArrayRealloc = nullptr;
 	void *StaticFindObjectFast = nullptr;

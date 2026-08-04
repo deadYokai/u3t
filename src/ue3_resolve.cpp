@@ -180,6 +180,8 @@ static void dump_layout(const UE3Layout &L, const char *how)
 	         L.StaticLoadObject, L.FNameInit, L.Preload);
 	log_info("resolve: GConfig=%p (%p)", (void *)L.GConfig,
 	         L.GConfig ? *L.GConfig : nullptr);
+	log_info("resolve: GMalloc=%p GCreateMalloc=%p", (void *)L.GMalloc,
+	         L.GCreateMalloc);
 	log_info("resolve: FArchiveOff=0x%zX stride=0x%zX Name/Imp/Exp=0x%zX/0x%zX/"
 	         "0x%zX Loader=0x%zX Root=0x%zX",
 	         (size_t)L.l_FArchiveOff, (size_t)L.exp_stride, (size_t)L.l_NameMap,
@@ -414,6 +416,137 @@ bool derive_loader_off(const void *begin, const void *end, ptrdiff_t &out_off,
 	return true;
 }
 
+static bool extract_gmalloc_pattern(const void *begin, const void *end,
+                                    void **&out_gmalloc,
+                                    void *&out_create_malloc,
+                                    ptrdiff_t &out_realloc_voff)
+{
+	if (!begin || !end || begin >= end)
+		return false;
+
+	constexpr ptrdiff_t PS_ = static_cast<ptrdiff_t>(sizeof(void *));
+	ZydisDecoder dec = dx::native_decoder();
+	const uint8_t *p = static_cast<const uint8_t *>(begin);
+	const uint8_t *e = static_cast<const uint8_t *>(end);
+
+	auto global_from_mem = [](const ZydisDecodedOperand &op,
+	                          const uint8_t *insn_end) -> void **
+	{
+		if (op.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+		    op.mem.index != ZYDIS_REGISTER_NONE)
+			return nullptr;
+		if (op.mem.base == ZYDIS_REGISTER_RIP)
+			return reinterpret_cast<void **>(
+			    const_cast<uint8_t *>(insn_end) +
+			    static_cast<int32_t>(op.mem.disp.value));
+		if (op.mem.base == ZYDIS_REGISTER_NONE && op.mem.disp.has_displacement)
+			return reinterpret_cast<void **>(static_cast<uintptr_t>(
+			    static_cast<uint32_t>(op.mem.disp.value)));
+		return nullptr;
+	};
+
+	void **last_ecx_global = nullptr;
+	bool ecx_null_checked = false;
+
+	while (p < e)
+	{
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+		if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, e - p, &in, ops)))
+			break;
+		const uint8_t *next = p + in.length;
+
+		// MOV ECX/RCX, [global] — start tracking
+		if (in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+		    in.operand_count_visible >= 2 &&
+		    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    dxa::gpr_idx(ops[0].reg.value) == 1)
+		{
+			void **g = global_from_mem(ops[1], next);
+			if (g)
+			{
+				last_ecx_global = g;
+				ecx_null_checked = false;
+			}
+		}
+
+		// TEST ECX,ECX / CMP ECX,reg — null-check gate
+		if (last_ecx_global &&
+		    (in.mnemonic == ZYDIS_MNEMONIC_TEST ||
+		     in.mnemonic == ZYDIS_MNEMONIC_CMP) &&
+		    in.operand_count_visible >= 1 &&
+		    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    dxa::gpr_idx(ops[0].reg.value) == 1)
+			ecx_null_checked = true;
+
+		// CALL imm with prior null-checked global → check reload
+		if (in.mnemonic == ZYDIS_MNEMONIC_CALL &&
+		    in.operand_count_visible >= 1 && is_imm(ops[0]) &&
+		    last_ecx_global && ecx_null_checked && next < e)
+		{
+			ZydisDecodedInstruction ni;
+			ZydisDecodedOperand nop[ZYDIS_MAX_OPERAND_COUNT];
+			if (ZYAN_SUCCESS(
+			        ZydisDecoderDecodeFull(&dec, next, e - next, &ni, nop)) &&
+			    ni.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    ni.operand_count_visible >= 2 &&
+			    nop[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    dxa::gpr_idx(nop[0].reg.value) == 1 &&
+			    global_from_mem(nop[1], next + ni.length) == last_ecx_global)
+			{
+				out_gmalloc = last_ecx_global;
+				out_create_malloc = reinterpret_cast<void *>(
+				    const_cast<uint8_t *>(next) +
+				    static_cast<int32_t>(ops[0].imm.value.s));
+
+				// scan for vtable dereference: MOV reg,[ECX] + MOV reg2,[reg+d]
+				const uint8_t *vp = next + ni.length;
+				int vt_reg = -1;
+				for (int vi = 0; vi < 12 && vp < e; ++vi)
+				{
+					ZydisDecodedInstruction vi_in;
+					ZydisDecodedOperand vi_op[ZYDIS_MAX_OPERAND_COUNT];
+					if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, vp, e - vp,
+					                                       &vi_in, vi_op)))
+						break;
+					if (vi_in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+					    vi_in.operand_count_visible >= 2 &&
+					    vi_op[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					    vi_op[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					    vi_op[1].mem.index == ZYDIS_REGISTER_NONE)
+					{
+						int src = dxa::gpr_idx(vi_op[1].mem.base);
+						int64_t d = vi_op[1].mem.disp.has_displacement
+						                ? vi_op[1].mem.disp.value
+						                : 0;
+						if (src == 1 && d == 0)
+							vt_reg = dxa::gpr_idx(vi_op[0].reg.value);
+						else if (vt_reg >= 0 && src == vt_reg && d > 0 &&
+						         d < 64 * PS_)
+						{
+							out_realloc_voff = static_cast<ptrdiff_t>(d);
+							return true;
+						}
+					}
+					vp += vi_in.length;
+				}
+				out_realloc_voff = 2 * PS_;
+				return true;
+			}
+		}
+
+		// any CALL clobbers ECX/RCX — reset tracking
+		if (in.mnemonic == ZYDIS_MNEMONIC_CALL)
+		{
+			last_ecx_global = nullptr;
+			ecx_null_checked = false;
+		}
+
+		p = next;
+	}
+	return false;
+}
+
 bool ue3_resolve(UE3Layout &L)
 {
 	ModuleImage img = anchor::image_of(nullptr);
@@ -466,8 +599,7 @@ bool ue3_resolve(UE3Layout &L)
 		else
 		{
 			void **g = nullptr;
-			if (dx::first_global_noncookie(fn, anchor::function_end(img, fn),
-			                               g))
+			if (dx::first_global_this(fn, anchor::function_end(img, fn), g))
 				L.GConfig = g;
 			else
 				log_warn("resolve: GConfig not derived from "
@@ -705,7 +837,18 @@ bool ue3_resolve(UE3Layout &L)
 		if (dxa::indexed_store_global(fn, fend, arr, static_cast<int>(PS)))
 		{
 			L.FNameNamesArr = reinterpret_cast<uint8_t *>(arr);
-			L.ArrayRealloc = dx::call_feeding_global_store(fn, fend, arr);
+			{
+				ptrdiff_t rvoff = 0;
+				extract_gmalloc_pattern(fn, fend, L.GMalloc, L.GCreateMalloc,
+				                        rvoff);
+				L.ArrayRealloc = dx::call_feeding_global_store(fn, fend, arr);
+				if (L.GMalloc && *L.GMalloc && rvoff > 0 && !L.ArrayRealloc)
+				{
+					void **vt = *reinterpret_cast<void ***>(*L.GMalloc);
+					L.ArrayRealloc = *reinterpret_cast<void **>(
+					    reinterpret_cast<uint8_t *>(vt) + rvoff);
+				}
+			}
 			break;
 		}
 	}
@@ -754,13 +897,26 @@ bool ue3_resolve(UE3Layout &L)
 				                              static_cast<int>(PS)))
 				{
 					L.FNameNamesArr = reinterpret_cast<uint8_t *>(arr);
-					L.ArrayRealloc =
-					    dx::call_feeding_global_store(t.target, tend, arr);
+					{
+						ptrdiff_t rvoff = 0;
+						extract_gmalloc_pattern(t.target, tend, L.GMalloc,
+						                        L.GCreateMalloc, rvoff);
+						if (L.GMalloc && *L.GMalloc && rvoff > 0)
+						{
+							void **vt = *reinterpret_cast<void ***>(*L.GMalloc);
+							L.ArrayRealloc = *reinterpret_cast<void **>(
+							    reinterpret_cast<uint8_t *>(vt) + rvoff);
+						}
+					}
 					log_info(
 					    "resolve: FNameNamesArr=%p via FName::StaticInit=%p "
 					    "(register-fn=%p called %dx)",
 					    (void *)L.FNameNamesArr, static_init, t.target,
 					    t.count);
+					log_info(
+					    "resolve: ArrayRealloc=%p via FName::StaticInit=%p",
+					    (void *)L.ArrayRealloc, static_init);
+
 					break;
 				}
 			}
@@ -774,6 +930,11 @@ bool ue3_resolve(UE3Layout &L)
 
 	if (L.FNameNamesArr && !L.ArrayRealloc)
 		log_warn("resolve: ArrayRealloc not found (runtime append disabled)");
+
+	if (L.FNameNamesArr && !L.GMalloc)
+		log_warn("resolve: GMalloc not found (runtime append disabled)");
+	if (L.FNameNamesArr && !L.GCreateMalloc)
+		log_warn("resolve: GCreateMalloc not found");
 
 	if (PS == 4 && !L.FNameInit)
 	{

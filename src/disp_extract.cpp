@@ -161,6 +161,36 @@ namespace dx
 		return false;
 	}
 
+	bool first_global_this(const void *begin, const void *end,
+	                       void **&out_global)
+	{
+		Dec dec;
+		const uint8_t *p = u8(begin), *e = u8(end);
+		ZydisDecodedInstruction in;
+		ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+
+		const ZydisRegister this_reg =
+		    (sizeof(void *) == 8) ? ZYDIS_REGISTER_RCX : ZYDIS_REGISTER_ECX;
+
+		while (p < e)
+		{
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec.d, p, e - p, &in, ops)))
+				break;
+			void **g = nullptr;
+			if (in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    in.operand_count_visible >= 2 &&
+			    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    ops[0].reg.value == this_reg &&
+			    dxa::global_from_mem(in, ops[1], p, g))
+			{
+				out_global = g;
+				return true;
+			}
+			p += in.length;
+		}
+		return false;
+	}
+
 	bool first_global_noncookie(const void *begin, const void *end,
 	                            void **&out_global)
 	{
@@ -788,6 +818,10 @@ namespace dx
 				const uint8_t *next = p + in.length;
 				last_call = const_cast<uint8_t *>(next) +
 				            static_cast<int32_t>(op[0].imm.value.s);
+			}
+			else if (in.mnemonic == ZYDIS_MNEMONIC_CALL)
+			{
+				last_call = nullptr;
 			}
 			else if (in.mnemonic == ZYDIS_MNEMONIC_MOV &&
 			         in.operand_count_visible >= 2 && is_mem(op[0]) &&

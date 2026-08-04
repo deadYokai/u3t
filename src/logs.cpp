@@ -10,13 +10,17 @@
 
 namespace logs
 {
+	static bool g_log_debug = false;
 	static HANDLE g_file = INVALID_HANDLE_VALUE;
 	static SRWLOCK g_lock = SRWLOCK_INIT;
 	static std::atomic<bool> g_initialized{false};
 
-	void init()
+	void init(bool debug = false)
 	{
 		AcquireSRWLockExclusive(&g_lock);
+
+		g_log_debug = debug;
+
 		if (!g_initialized)
 		{
 			std::wstring path = get_mods_dir() + L"\\cu3ml.log";
@@ -29,6 +33,7 @@ namespace logs
 				g_initialized = true;
 			}
 		}
+
 		ReleaseSRWLockExclusive(&g_lock);
 	}
 
@@ -70,6 +75,14 @@ namespace logs
 			snprintf(buffer, sizeof(buffer), "[%s] %s\n", level, start);
 			raw_write(buffer);
 		}
+	}
+
+	void write_debug(const char *msg)
+	{
+		if (!g_log_debug)
+			return;
+
+		write_line("DEBUG ", msg);
 	}
 
 	static int format_guarded(char *buf, size_t cap, const char *fmt,

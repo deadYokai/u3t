@@ -5,33 +5,11 @@
 #include <cstdint>
 #include <cstring>
 
-#include "callconv.hpp"
-
 #include "logs.hpp"
 
 namespace
 {
 	constexpr int PS = static_cast<int>(sizeof(void *));
-
-	void *game_realloc(void *data, uint32_t old_bytes, uint32_t new_bytes)
-	{
-		UE3Layout &L = ue3();
-		if (!L.ArrayRealloc)
-			return nullptr;
-		if (PS == 8)
-		{
-			dx::CallConvInvoker<void *, void *, uint32_t, uint32_t> Fn(
-			    L.ArrayRealloc);
-			return Fn(data, old_bytes, new_bytes);
-		}
-		else
-		{
-			// x86 appRealloc(Original, NewBytes, Alignment)
-			dx::CallConvInvoker<void *, void *, uint32_t, uint32_t> Fn(
-			    L.ArrayRealloc);
-			return Fn(data, new_bytes, 8);
-		}
-	}
 
 	void *tarray_add_uninit(UE3TArray *arr, int count, int elem_size)
 	{
@@ -42,9 +20,9 @@ namespace
 		if (new_num > arr->Max)
 		{
 			const int new_max = new_num;
-			void *nd = game_realloc(arr->Data,
-			                        static_cast<uint32_t>(arr->Max * elem_size),
-			                        static_cast<uint32_t>(new_max * elem_size));
+			void *nd = ue3_api::game_realloc(
+			    arr->Data, static_cast<uint32_t>(arr->Max * elem_size),
+			    static_cast<uint32_t>(new_max * elem_size));
 			if (!nd)
 				return nullptr;
 			arr->Data = nd;

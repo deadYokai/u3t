@@ -460,6 +460,91 @@ namespace hook
 
 	static std::vector<HookEntry> g_hooks;
 
+	void log_function_convention_simple(void *func, const char *label = nullptr)
+	{
+		if (!func)
+		{
+			log_info("convention: (null)");
+			return;
+		}
+
+		uint8_t *addr = static_cast<uint8_t *>(func);
+		ZydisDecoder &decoder = get_dec();  // 32‑bit decoder
+
+		bool ecx_first_read = false;
+		bool ecx_first_write = false;
+		bool ecx_first_done = false;
+		bool edx_first_read = false;
+		bool edx_first_write = false;
+		bool edx_first_done = false;
+
+		size_t offset = 0;
+		const int MAX_INSTR = 16;
+
+		for (int i = 0; i < MAX_INSTR; ++i)
+		{
+			ZydisDecodedInstruction insn;
+			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&decoder, addr + offset,
+			                                       ZYDIS_MAX_INSTRUCTION_LENGTH,
+			                                       &insn, ops)))
+			{
+				break;
+			}
+
+			for (size_t op_idx = 0; op_idx < insn.operand_count; ++op_idx)
+			{
+				const auto &op = ops[op_idx];
+				if (op.type != ZYDIS_OPERAND_TYPE_REGISTER)
+					continue;
+
+				ZydisRegister reg = op.reg.value;
+				bool is_read = (op.actions & ZYDIS_OPERAND_ACTION_READ) != 0;
+				bool is_write = (op.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0;
+
+				if (reg == ZYDIS_REGISTER_ECX && !ecx_first_done)
+				{
+					ecx_first_done = true;
+					ecx_first_read = is_read;
+					ecx_first_write = is_write;
+				}
+				if (reg == ZYDIS_REGISTER_EDX && !edx_first_done)
+				{
+					edx_first_done = true;
+					edx_first_read = is_read;
+					edx_first_write = is_write;
+				}
+			}
+
+			// Stop at RET (function end)
+			if (insn.mnemonic == ZYDIS_MNEMONIC_RET)
+				break;
+
+			offset += insn.length;
+		}
+
+		bool is_thiscall =
+		    ecx_first_done && ecx_first_read;  // first access is a read
+		bool uses_edx =
+		    edx_first_done && edx_first_read;  // first access is a read
+
+		char msg[128];
+		if (label)
+		{
+			snprintf(msg, sizeof(msg), "convention %s: thiscall=%s, edx=%s",
+			         label, is_thiscall ? "true" : "false",
+			         uses_edx ? "true" : "false");
+		}
+		else
+		{
+			snprintf(msg, sizeof(msg), "convention %p: thiscall=%s, edx=%s",
+			         func, is_thiscall ? "true" : "false",
+			         uses_edx ? "true" : "false");
+		}
+		log_info(msg);
+	}
+
 	static bool install_one(HookEntry &h)
 	{
 		if (h.installed)
@@ -657,6 +742,7 @@ namespace hook
 		log_info("hook: installed %p -> %p  tramp=%p  prologue=%zuB  "
 		         "tramp_used=%zuB",
 		         h.target, h.detour, tramp, total, tp_used);
+		log_function_convention_simple(h.target, "target");
 		return true;
 	}
 

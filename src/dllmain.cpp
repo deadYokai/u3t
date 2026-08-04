@@ -11,7 +11,8 @@
 #include "ue3_layout.hpp"
 #include "util.hpp"
 
-#include "manager/ui.hpp"
+#include "ui/manager/ui.hpp"
+#include "ui/overlay/overlay.hpp"
 
 #include <unknwn.h>
 #include <windows.h>
@@ -422,7 +423,7 @@ static void guardmain()
 
 static DWORD WINAPI init_thread(LPVOID)
 {
-	logs::init();
+	logs::init(cmdline_has_switch(L"cu3ml-debug"));
 	addr_cache::init();
 	loader_config::load();
 	SYSTEMTIME st{};
@@ -444,6 +445,9 @@ static DWORD WINAPI init_thread(LPVOID)
 
 	log_info("init_thread: discovering mods");
 	mod_loader::discover();
+
+	log_info("init_thread: installing overlay creation hooks");
+	overlay::init();
 
 	log_info("init_thread: installing GEngineLoop::Init hook");
 	if (!install_engine_loop_init_hook())

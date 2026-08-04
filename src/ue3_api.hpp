@@ -10,8 +10,10 @@
 
 #ifdef _WIN64
 #define UE3_THISCALL
+#define UE3_FASTCALL
 #else
 #define UE3_THISCALL __thiscall
+#define UE3_FASTCALL __fastcall
 #endif
 
 #ifdef _WIN64
@@ -28,6 +30,8 @@
 
 namespace ue3_api
 {
+	void *game_realloc(void *data, uint32_t old_bytes, uint32_t new_bytes);
+
 	enum class MatchMode
 	{
 		Any,

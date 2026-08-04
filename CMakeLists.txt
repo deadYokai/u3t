@@ -37,7 +37,14 @@ if(MINGW)
     endforeach()
 endif()
 
-file(GLOB WRAPPER_SOURCES CONFIGURE_DEPENDS src/*.cpp src/manager/*.cpp)
+file(
+    GLOB WRAPPER_SOURCES
+    CONFIGURE_DEPENDS
+	src/ui/overlay/*.cpp
+	src/ui/manager/*.cpp
+    src/ui/*.cpp
+    src/*.cpp
+)
 
 file(GLOB LUA_SRC CONFIGURE_DEPENDS third_party/lua/l*.c)
 list(
@@ -54,6 +61,8 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+	${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
+	${IMGUI_DIR}/backends/imgui_impl_dx9.cpp
 )
 
 add_library(dinput8 SHARED ${IMGUI_SOURCES} ${LUA_SRC} ${WRAPPER_SOURCES})
@@ -87,7 +96,7 @@ target_compile_definitions(
 
 target_link_libraries(
     dinput8
-    PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32
+    PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32 d3d9 d3d11 dxgi
 )
 
 set_target_properties(dinput8 PROPERTIES PREFIX "")

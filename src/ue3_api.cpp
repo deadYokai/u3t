@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include "ue3_api.hpp"
+#include "ue3_layout.hpp"
 
 #include "anchor.hpp"
 #include "logs.hpp"
@@ -11,8 +12,30 @@
 
 #include <windows.h>
 
+constexpr int PS = static_cast<int>(sizeof(void *));
+
 namespace ue3_api
 {
+
+	void *game_realloc(void *data, uint32_t old_bytes, uint32_t new_bytes)
+	{
+		UE3Layout &L = ue3();
+		if (!L.GMalloc)
+			return nullptr;
+		void *m = *L.GMalloc;
+		if (!m && L.GCreateMalloc)
+		{
+			reinterpret_cast<void (*)()>(L.GCreateMalloc)();
+			m = *L.GMalloc;
+		}
+		if (!m)
+			return nullptr;
+		auto vt = *reinterpret_cast<void ***>(m);
+		auto fn = reinterpret_cast<void *(
+		    __thiscall *)(void *, void *, uint32_t, uint32_t)>(vt[2]);
+		return fn(m, data, new_bytes, 8);
+	}
+
 	namespace
 	{
 		std::unordered_map<std::wstring, std::vector<void *>> g_set_cache;

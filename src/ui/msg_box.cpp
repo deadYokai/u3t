@@ -7,7 +7,7 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_win32.h"
 
-#include "manager/gl_ctx.hpp"
+#include "gl_ctx.hpp"
 
 #include "util.hpp"
 

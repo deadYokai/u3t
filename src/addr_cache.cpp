@@ -406,6 +406,8 @@ namespace addr_cache
 	X("ue3.Preload", Preload)                           \
 	X("ue3.FNameInit", FNameInit)                       \
 	X("ue3.ArrayRealloc", ArrayRealloc)                 \
+	X("ue3.GMalloc", GMalloc)                           \
+	X("ue3.GCreateMalloc", GCreateMalloc)               \
 	X("ue3.GPackageFileCache", GPackageFileCache)       \
 	X("ue3.GConfig", GConfig)                           \
 	X("ue3.FNameNamesArr", FNameNamesArr)               \
