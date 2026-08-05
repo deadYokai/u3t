@@ -412,7 +412,7 @@ namespace
 		{
 			if (!v[i].has_mem || v[i].mem_base != base || v[i].mem_disp != disp)
 				continue;
-			if (v[i].m == ZYDIS_MNEMONIC_MOV)
+			if (v[i].m == ZYDIS_MNEMONIC_MOV || v[i].m == ZYDIS_MNEMONIC_PUSH)
 				return true;
 			if (v[i].m == ZYDIS_MNEMONIC_LEA)
 				return false;
@@ -497,10 +497,7 @@ namespace
 			*out_remove_key = rem;
 			*out_combine = b;
 			*out_key_ctor = (void *)ctor;
-			const auto rk = dx::detect_call_conv(rem);
-			*out_fname_keyed = (rk.stack_cleanup_bytes >= 8);
-			log_info("lua: removekey=%p ret=%d fname_keyed=%d", rem,
-			         rk.stack_cleanup_bytes, (int)*out_fname_keyed);
+			*out_fname_keyed = key_is_by_value(v, rem_ctor_i, rem_op_i);
 			log_info("lua: localize - keyctor=%p fname_keyed=%d",
 			         (const void *)ctor, (int)*out_fname_keyed);
 			return true;

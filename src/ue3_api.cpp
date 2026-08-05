@@ -17,7 +17,7 @@ constexpr int PS = static_cast<int>(sizeof(void *));
 namespace ue3_api
 {
 
-	void *game_realloc(void *data, uint32_t count, uint32_t alignment)
+	void *game_realloc(void *data, unsigned count, unsigned alignment)
 	{
 		log_debug("call -> game_realloc(data=%p, count=%i, alignment=%i)", data, count, alignment);
 		UE3Layout &L = ue3();
@@ -32,7 +32,7 @@ namespace ue3_api
 		if (!edx)
 			return nullptr;
 		auto fn = reinterpret_cast<void *(
-		    UE3_THISCALL *)(void *, UE3_EDX uint32_t, uint32_t)>(L.ArrayRealloc);
+		    UE3_THISCALL *)(void *, UE3_EDX unsigned, unsigned)>(L.ArrayRealloc);
 		return fn(UE3_EDX_ARG_2 data, count, alignment);
 	}
 
