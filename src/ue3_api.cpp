@@ -17,23 +17,23 @@ constexpr int PS = static_cast<int>(sizeof(void *));
 namespace ue3_api
 {
 
-	void *game_realloc(void *data, uint32_t old_bytes, uint32_t new_bytes)
+	void *game_realloc(void *data, uint32_t count, uint32_t alignment)
 	{
+		log_debug("call -> game_realloc(data=%p, count=%i, alignment=%i)", data, count, alignment);
 		UE3Layout &L = ue3();
 		if (!L.GMalloc)
 			return nullptr;
-		void *m = *L.GMalloc;
-		if (!m && L.GCreateMalloc)
+		void *edx = *L.GMalloc;
+		if (!edx && L.GCreateMalloc)
 		{
 			reinterpret_cast<void (*)()>(L.GCreateMalloc)();
-			m = *L.GMalloc;
+			edx = *L.GMalloc;
 		}
-		if (!m)
+		if (!edx)
 			return nullptr;
-		auto vt = *reinterpret_cast<void ***>(m);
 		auto fn = reinterpret_cast<void *(
-		    __thiscall *)(void *, void *, uint32_t, uint32_t)>(vt[2]);
-		return fn(m, data, new_bytes, 8);
+		    UE3_THISCALL *)(void *, UE3_EDX uint32_t, uint32_t)>(L.ArrayRealloc);
+		return fn(UE3_EDX_ARG_2 data, count, alignment);
 	}
 
 	namespace

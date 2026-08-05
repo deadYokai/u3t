@@ -62,6 +62,7 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 	${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
+	${IMGUI_DIR}/backends/imgui_impl_dx10.cpp
 	${IMGUI_DIR}/backends/imgui_impl_dx9.cpp
 )
 
@@ -96,7 +97,7 @@ target_compile_definitions(
 
 target_link_libraries(
     dinput8
-    PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32 d3d9 d3d11 dxgi
+    PRIVATE Zydis psapi opengl32 gdi32 dwmapi imm32 d3d9 d3d11 d3d10 dxgi
 )
 
 set_target_properties(dinput8 PROPERTIES PREFIX "")

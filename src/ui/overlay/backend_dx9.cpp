@@ -55,6 +55,8 @@ namespace
 
 	bool init_imgui(IDirect3DDevice9 *dev)
 	{
+		if (!overlay::try_claim_backend("dx9"))
+			return false;
 		D3DDEVICE_CREATION_PARAMETERS cp{};
 		if (FAILED(dev->GetCreationParameters(&cp)))
 			return false;

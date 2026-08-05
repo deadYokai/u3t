@@ -23,11 +23,26 @@ namespace
 
 namespace overlay
 {
+	namespace
+	{
+		std::atomic<bool> g_claimed{false};
+	}
+
+	bool try_claim_backend(const char *name)
+	{
+		bool expected = false;
+		if (!g_claimed.compare_exchange_strong(expected, true))
+			return false;
+		log_info("overlay: backend claimed by %s", name);
+		return true;
+	}
+
 	void clear_state()
 	{
 		g_draw_cbs.clear();
 		g_visible.store(false);
 		g_ready.store(false);
+		g_claimed.store(false);
 	}
 
 	bool visible() { return g_visible.load(std::memory_order_relaxed); }

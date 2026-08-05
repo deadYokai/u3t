@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "logs.hpp"
 #include "overlay.hpp"
+#include <atomic>
 #include <windows.h>
 
 namespace overlay_dx11
@@ -8,6 +9,12 @@ namespace overlay_dx11
 	bool install();
 	void remove();
 }  // namespace overlay_dx11
+
+namespace overlay_dx10
+{
+	bool install();
+	void remove();
+}  // namespace overlay_dx10
 
 namespace overlay_dx9
 {
@@ -17,51 +24,49 @@ namespace overlay_dx9
 
 namespace overlay
 {
-	enum class Backend
-	{
-		None,
-		DX9,
-		DX11
-	};
-	static Backend g_backend = Backend::None;
+
+	static std::atomic<bool> g_dx9{false};
+	static std::atomic<bool> g_dx10{false};
+	static std::atomic<bool> g_dx11{false};
 
 	void init()
 	{
-		if (g_backend != Backend::None)
-			return;
+		int n = 0;
 
+		if (overlay_dx10::install())
+		{
+			g_dx10.store(true);
+			++n;
+		}
 		if (overlay_dx11::install())
 		{
-			g_backend = Backend::DX11;
-			log_info("overlay: using DX11 backend");
-			return;
+			g_dx11.store(true);
+			++n;
 		}
-
 		if (overlay_dx9::install())
 		{
-			g_backend = Backend::DX9;
-			log_info("overlay: using DX9 backend");
-			return;
+			g_dx9.store(true);
+			++n;
 		}
 
-		log_warn("overlay: no DX backend available "
-		         "(neither d3d9.dll nor d3d11.dll loaded)");
+		if (n)
+			log_info("overlay: %d backend(s) armed", n);
+		else
+			log_warn("overlay: no backends installed");
 	}
 
 	void shutdown()
 	{
-		switch (g_backend)
-		{
-			case Backend::DX11:
-				overlay_dx11::remove();
-				break;
-			case Backend::DX9:
-				overlay_dx9::remove();
-				break;
-			default:
-				break;
-		}
-		g_backend = Backend::None;
+		if (g_dx11.load())
+			overlay_dx11::remove();
+		if (g_dx10.load())
+			overlay_dx10::remove();
+		if (g_dx9.load())
+			overlay_dx9::remove();
+
+		g_dx9.store(false);
+		g_dx10.store(false);
+		g_dx11.store(false);
 		clear_state();
 		log_info("overlay: shutdown");
 	}

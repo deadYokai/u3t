@@ -30,7 +30,7 @@
 
 namespace ue3_api
 {
-	void *game_realloc(void *data, uint32_t old_bytes, uint32_t new_bytes);
+	void *game_realloc(void *data, uint32_t count, uint32_t alignment = 8);
 
 	enum class MatchMode
 	{

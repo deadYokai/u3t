@@ -9,6 +9,7 @@ namespace overlay
 {
 	void init();
 	void shutdown();
+	bool try_claim_backend(const char *name);
 
 	bool visible();
 	void set_visible(bool v);

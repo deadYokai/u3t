@@ -8,11 +8,11 @@
 #include "ui/theme.hpp"
 
 #include "imgui.h"
-#include "imgui_impl_dx11.h"
+#include "imgui_impl_dx10.h"
 #include "imgui_impl_win32.h"
 
 #include <atomic>
-#include <d3d11.h>
+#include <d3d10.h>
 #include <dxgi.h>
 #include <windows.h>
 
@@ -33,10 +33,8 @@ namespace
 	WNDPROC g_orig_wndproc = nullptr;
 	HWND g_hwnd = nullptr;
 
-	ID3D11Device *g_device = nullptr;
-	ID3D11DeviceContext *g_context = nullptr;
-	ID3D11RenderTargetView *g_rtv = nullptr;
-
+	ID3D10Device *g_device = nullptr;
+	ID3D10RenderTargetView *g_rtv = nullptr;
 	IDXGISwapChain *g_game_sc = nullptr;
 
 	std::atomic<bool> g_imgui_init{false};
@@ -64,9 +62,9 @@ namespace
 
 	void create_rtv(IDXGISwapChain *sc)
 	{
-		ID3D11Texture2D *back = nullptr;
+		ID3D10Texture2D *back = nullptr;
 		if (SUCCEEDED(
-		        sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back)))
+		        sc->GetBuffer(0, __uuidof(ID3D10Texture2D), (void **)&back)))
 		{
 			g_device->CreateRenderTargetView(back, nullptr, &g_rtv);
 			back->Release();
@@ -84,29 +82,28 @@ namespace
 
 	bool init_imgui(IDXGISwapChain *sc)
 	{
-		if (!overlay::try_claim_backend("dx11"))
+		if (!overlay::try_claim_backend("dx10"))
 			return false;
 		DXGI_SWAP_CHAIN_DESC desc{};
 		if (FAILED(sc->GetDesc(&desc)))
 		{
-			log_err("overlay_dx11: GetDesc failed");
+			log_err("overlay_dx10: GetDesc failed");
 			return false;
 		}
 
 		g_hwnd = desc.OutputWindow;
 		if (!g_hwnd)
 		{
-			log_err("overlay_dx11: no OutputWindow");
+			log_err("overlay_dx10: no OutputWindow");
 			return false;
 		}
 
-		if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void **)&g_device)))
+		if (FAILED(sc->GetDevice(__uuidof(ID3D10Device), (void **)&g_device)))
 		{
-			log_err("overlay_dx11: GetDevice failed");
+			log_err("overlay_dx10: GetDevice failed");
 			return false;
 		}
 
-		g_device->GetImmediateContext(&g_context);
 		create_rtv(sc);
 
 		IMGUI_CHECKVERSION();
@@ -118,12 +115,12 @@ namespace
 
 		if (!ImGui_ImplWin32_Init(g_hwnd))
 		{
-			log_err("overlay_dx11: ImGui_ImplWin32_Init failed");
+			log_err("overlay_dx10: ImGui_ImplWin32_Init failed");
 			return false;
 		}
-		if (!ImGui_ImplDX11_Init(g_device, g_context))
+		if (!ImGui_ImplDX10_Init(g_device))
 		{
-			log_err("overlay_dx11: ImGui_ImplDX11_Init failed");
+			log_err("overlay_dx10: ImGui_ImplDX10_Init failed");
 			return false;
 		}
 
@@ -132,7 +129,7 @@ namespace
 
 		g_imgui_init.store(true);
 		overlay::on_backend_ready();
-		log_info("overlay_dx11: imgui ready  hwnd=%p dev=%p", (void *)g_hwnd,
+		log_info("overlay_dx10: imgui ready  hwnd=%p dev=%p", (void *)g_hwnd,
 		         (void *)g_device);
 		return true;
 	}
@@ -143,16 +140,11 @@ namespace
 			return;
 		g_imgui_init.store(false);
 
-		ImGui_ImplDX11_Shutdown();
+		ImGui_ImplDX10_Shutdown();
 		ImGui_ImplWin32_Shutdown();
 		ImGui::DestroyContext();
 
 		cleanup_rtv();
-		if (g_context)
-		{
-			g_context->Release();
-			g_context = nullptr;
-		}
 		if (g_device)
 		{
 			g_device->Release();
@@ -174,7 +166,7 @@ namespace
 				return g_orig_present(sc, sync, flags);
 		}
 
-		ImGui_ImplDX11_NewFrame();
+		ImGui_ImplDX10_NewFrame();
 		ImGui_ImplWin32_NewFrame();
 		ImGui::NewFrame();
 
@@ -184,9 +176,9 @@ namespace
 		ImGui::Render();
 
 		if (g_rtv)
-			g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+			g_device->OMSetRenderTargets(1, &g_rtv, nullptr);
 
-		ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+		ImGui_ImplDX10_RenderDrawData(ImGui::GetDrawData());
 
 		return g_orig_present(sc, sync, flags);
 	}
@@ -212,7 +204,7 @@ namespace
 		void *present_fn = vtbl[8];
 		void *resize_fn = vtbl[13];
 
-		log_info("overlay_dx11: game swapchain vtable  Present=%p "
+		log_info("overlay_dx10: game swapchain vtable  Present=%p "
 		         "ResizeBuffers=%p",
 		         present_fn, resize_fn);
 
@@ -223,113 +215,68 @@ namespace
 		hook::install_all();
 
 		if (g_orig_present)
-			log_info("overlay_dx11: Present hook live");
+			log_info("overlay_dx10: Present hook live");
 		else
-			log_err("overlay_dx11: Present hook failed");
+			log_err("overlay_dx10: Present hook failed");
 	}
 
-	using CreateDevAndSC_t = HRESULT(WINAPI *)(
-	    IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
-	    const D3D_FEATURE_LEVEL *, UINT, UINT, const DXGI_SWAP_CHAIN_DESC *,
-	    IDXGISwapChain **, ID3D11Device **, D3D_FEATURE_LEVEL *,
-	    ID3D11DeviceContext **);
+	using CreateDevAndSC_t = HRESULT(WINAPI *)(IDXGIAdapter *,
+	                                           D3D10_DRIVER_TYPE, HMODULE, UINT,
+	                                           UINT, DXGI_SWAP_CHAIN_DESC *,
+	                                           IDXGISwapChain **,
+	                                           ID3D10Device **);
 
 	CreateDevAndSC_t g_orig_create = nullptr;
 
-	HRESULT WINAPI hk_create(IDXGIAdapter *pAdapter, D3D_DRIVER_TYPE dt,
-	                         HMODULE sw, UINT flags,
-	                         const D3D_FEATURE_LEVEL *pFL, UINT nFL,
-	                         UINT sdkVer, const DXGI_SWAP_CHAIN_DESC *pSCDesc,
-	                         IDXGISwapChain **ppSC, ID3D11Device **ppDev,
-	                         D3D_FEATURE_LEVEL *pFL_out,
-	                         ID3D11DeviceContext **ppCtx)
+	HRESULT WINAPI hk_create(IDXGIAdapter *pAdapter, D3D10_DRIVER_TYPE dt,
+	                         HMODULE sw, UINT flags, UINT sdkVer,
+	                         DXGI_SWAP_CHAIN_DESC *pSCDesc,
+	                         IDXGISwapChain **ppSC, ID3D10Device **ppDev)
 	{
-		HRESULT hr = g_orig_create(pAdapter, dt, sw, flags, pFL, nFL, sdkVer,
-		                           pSCDesc, ppSC, ppDev, pFL_out, ppCtx);
+		HRESULT hr = g_orig_create(pAdapter, dt, sw, flags, sdkVer, pSCDesc,
+		                           ppSC, ppDev);
 
 		if (SUCCEEDED(hr) && ppSC && *ppSC)
 		{
-			log_info("overlay_dx11: intercepted game swapchain %p", *ppSC);
+			log_info("overlay_dx10: intercepted game swapchain %p", *ppSC);
 			hook_swapchain_vtable(*ppSC);
 		}
 
 		return hr;
-	}
-
-	using FactoryCreateSC_t = HRESULT(WINAPI *)(IDXGIFactory *, IUnknown *,
-	                                            DXGI_SWAP_CHAIN_DESC *,
-	                                            IDXGISwapChain **);
-
-	FactoryCreateSC_t g_orig_factory_create_sc = nullptr;
-
-	HRESULT WINAPI hk_factory_create_sc(IDXGIFactory *factory, IUnknown *dev,
-	                                    DXGI_SWAP_CHAIN_DESC *desc,
-	                                    IDXGISwapChain **ppSC)
-	{
-		HRESULT hr = g_orig_factory_create_sc(factory, dev, desc, ppSC);
-
-		if (SUCCEEDED(hr) && ppSC && *ppSC)
-		{
-			log_info("overlay_dx11: intercepted factory swapchain %p", *ppSC);
-			hook_swapchain_vtable(*ppSC);
-		}
-		return hr;
-	}
-
-	void hook_factory_create_swapchain()
-	{
-		IDXGIFactory *factory = nullptr;
-		if (FAILED(
-		        CreateDXGIFactory(__uuidof(IDXGIFactory), (void **)&factory)))
-			return;
-
-		void **vtbl = *reinterpret_cast<void ***>(factory);
-		void *create_sc = vtbl[10];  // IDXGIFactory::CreateSwapChain
-		factory->Release();
-
-		if (!create_sc)
-			return;
-
-		hook::add(create_sc, reinterpret_cast<void *>(&hk_factory_create_sc),
-		          reinterpret_cast<void **>(&g_orig_factory_create_sc));
-
-		log_info("overlay_dx11: hooked IDXGIFactory::CreateSwapChain=%p",
-		         create_sc);
 	}
 }  // namespace
 
-namespace overlay_dx11
+namespace overlay_dx10
 {
 	bool install()
 	{
-		HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
-		if (!d3d11)
+		HMODULE d3d10 = GetModuleHandleW(L"d3d10.dll");
+		if (!d3d10)
 			return false;
 
 		void *create_fn =
-		    (void *)GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain");
-		if (create_fn)
+		    (void *)GetProcAddress(d3d10, "D3D10CreateDeviceAndSwapChain");
+
+		if (!create_fn)
 		{
-			hook::add(create_fn, reinterpret_cast<void *>(&hk_create),
-			          reinterpret_cast<void **>(&g_orig_create));
+			log_warn("overlay_dx10: D3D10CreateDeviceAndSwapChain not found");
+			return false;
 		}
 
-		hook_factory_create_swapchain();
-
+		hook::add(create_fn, reinterpret_cast<void *>(&hk_create),
+		          reinterpret_cast<void **>(&g_orig_create));
 		hook::install_all();
 
-		bool ok = g_orig_create || g_orig_factory_create_sc;
-		if (ok)
-			log_info("overlay_dx11: creation hooks installed  "
-			         "D3D11CreateDeviceAndSwapChain=%s "
-			         "Factory::CreateSwapChain=%s",
-			         g_orig_create ? "yes" : "no",
-			         g_orig_factory_create_sc ? "yes" : "no");
-		else
-			log_err("overlay_dx11: no creation hooks installed");
+		if (!g_orig_create)
+		{
+			log_err("overlay_dx10: hook install failed");
+			return false;
+		}
 
-		return ok;
+		log_info("overlay_dx10: hooked D3D10CreateDeviceAndSwapChain=%p",
+		         create_fn);
+		return true;
 	}
 
 	void remove() { shutdown_imgui(); }
-}  // namespace overlay_dx11
+}  // namespace overlay_dx10

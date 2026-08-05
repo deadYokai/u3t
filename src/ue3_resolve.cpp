@@ -547,6 +547,208 @@ static bool extract_gmalloc_pattern(const void *begin, const void *end,
 	return false;
 }
 
+static void **gmalloc_via_anchor(const ModuleImage &img,
+                                      const wchar_t *anchor_str)
+{
+	for (const void *s : anchor::find_wstr_all(img, anchor_str))
+	{
+		for (void *ref : anchor::find_refs(img, s))
+		{
+			void *fn = anchor::function_entry(img, ref);
+			uint8_t *fend = fn ? anchor::function_end(img, fn) : nullptr;
+			if (!fn || !fend)
+				continue;
+
+			ZydisDecoder dec = dx::native_decoder();
+			const uint8_t *p = static_cast<const uint8_t *>(fn);
+			const uint8_t *e = fend;
+			const uint8_t *r = static_cast<const uint8_t *>(ref);
+
+			void **cur = nullptr;
+			const uint8_t *cur_ip = nullptr;
+			bool vt_seen = false;
+			void **best = nullptr;
+			uint64_t best_gap = UINT64_MAX;
+
+			while (p < e)
+			{
+				ZydisDecodedInstruction in;
+				ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+				if (ZYAN_FAILED(
+				        ZydisDecoderDecodeFull(&dec, p, e - p, &in, ops)))
+					break;
+				const uint8_t *next = p + in.length;
+
+				if (in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+				    in.operand_count_visible >= 2 &&
+				    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+				    dxa::gpr_idx(ops[0].reg.value) == 1)
+				{
+					void **g = nullptr;
+					if (dxa::global_from_mem(in, ops[1], p, g))
+					{
+						cur = g;
+						cur_ip = p;
+					}
+					else
+						cur = nullptr;
+					vt_seen = false;
+					p = next;
+					continue;
+				}
+
+				if (cur && !vt_seen && in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+				    in.operand_count_visible >= 2 &&
+				    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+				    ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+				    ops[1].mem.index == ZYDIS_REGISTER_NONE &&
+				    dxa::gpr_idx(ops[1].mem.base) == 1 &&
+				    (!ops[1].mem.disp.has_displacement ||
+				     ops[1].mem.disp.value == 0))
+					vt_seen = true;
+
+				if (in.mnemonic == ZYDIS_MNEMONIC_CALL)
+				{
+					if (cur && vt_seen)
+					{
+						uint64_t gap = cur_ip >= r
+						                   ? static_cast<uint64_t>(cur_ip - r)
+						                   : static_cast<uint64_t>(r - cur_ip);
+						if (gap < best_gap)
+						{
+							best_gap = gap;
+							best = cur;
+						}
+					}
+					cur = nullptr;
+					vt_seen = false;
+				}
+
+				p = next;
+			}
+
+			if (best)
+				return best;
+		}
+	}
+	return nullptr;
+}
+
+static void *gcreatemalloc_from_guard(const ModuleImage &img, void **gmalloc)
+{
+	if (!gmalloc)
+		return nullptr;
+
+	std::vector<void *> seen;
+	for (void *ref : anchor::find_refs(img, gmalloc))
+	{
+		void *fn = anchor::function_entry(img, ref);
+		uint8_t *fend = fn ? anchor::function_end(img, fn) : nullptr;
+		if (!fn || !fend)
+			continue;
+		if (std::find(seen.begin(), seen.end(), fn) != seen.end())
+			continue;
+		seen.push_back(fn);
+
+		ZydisDecoder dec = dx::native_decoder();
+		const uint8_t *p = static_cast<const uint8_t *>(fn);
+		const uint8_t *e = fend;
+
+		int load_reg = -1;
+		bool null_checked = false;
+		void *create = nullptr;
+
+		while (p < e)
+		{
+			ZydisDecodedInstruction in;
+			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+			if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec, p, e - p, &in, ops)))
+				break;
+			const uint8_t *next = p + in.length;
+
+			if (in.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    in.operand_count_visible >= 2 &&
+			    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+			{
+				void **g = nullptr;
+				if (dxa::global_from_mem(in, ops[1], p, g) && g == gmalloc)
+				{
+					if (create)
+						return create;
+					load_reg = dxa::gpr_idx(ops[0].reg.value);
+					null_checked = false;
+					p = next;
+					continue;
+				}
+			}
+
+			if (load_reg >= 0 && !create &&
+			    (in.mnemonic == ZYDIS_MNEMONIC_TEST ||
+			     in.mnemonic == ZYDIS_MNEMONIC_CMP) &&
+			    in.operand_count_visible >= 1 &&
+			    ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    dxa::gpr_idx(ops[0].reg.value) == load_reg)
+				null_checked = true;
+
+			if (in.mnemonic == ZYDIS_MNEMONIC_CALL)
+			{
+				if (!create)
+				{
+					if (load_reg >= 0 && null_checked &&
+					    in.operand_count_visible >= 1 && is_imm(ops[0]) &&
+					    ops[0].imm.is_relative)
+						create = reinterpret_cast<void *>(
+						    const_cast<uint8_t *>(next) +
+						    static_cast<int32_t>(ops[0].imm.value.s));
+					else
+					{
+						load_reg = -1;
+						null_checked = false;
+					}
+				}
+			}
+
+			p = next;
+		}
+	}
+	return nullptr;
+}
+
+static void resolve_gmalloc(const ModuleImage &img, UE3Layout &L)
+{
+	L.GMalloc = gmalloc_via_anchor(img, L"DUMPALLOCS -AlphaSort");
+	if (!L.GMalloc)
+	{
+		log_warn("resolve: GMalloc DUMPALLOCS anchor not found, "
+		         "trying SETTRACKINGBASELINE");
+		L.GMalloc = gmalloc_via_anchor(img, L"SETTRACKINGBASELINE");
+	}
+	if (!L.GMalloc)
+	{
+		log_warn("resolve: GMalloc anchor not found");
+		return;
+	}
+	L.GCreateMalloc = gcreatemalloc_from_guard(img, L.GMalloc);
+	if (!L.GCreateMalloc)
+		log_warn("resolve: GCreateMalloc guard site not found");
+}
+
+static void resolve_malloc_helpers(const void *fn, const uint8_t *fend,
+                                   void **arr, UE3Layout &L)
+{
+	if (!fn || !fend)
+		return;
+	L.ArrayRealloc = dx::call_feeding_global_store(fn, fend, arr);
+	if (!L.ArrayRealloc && L.GMalloc && *L.GMalloc)
+	{
+		void **vt = *reinterpret_cast<void ***>(*L.GMalloc);
+		L.ArrayRealloc = *reinterpret_cast<void **>(
+		    reinterpret_cast<uint8_t *>(vt) + 2 * PS);
+	}
+	log_info("resolve: ArrayRealloc=%p (via FName fn=%p)",
+	         (void *)L.ArrayRealloc, fn);
+}
+
 bool ue3_resolve(UE3Layout &L)
 {
 	ModuleImage img = anchor::image_of(nullptr);
@@ -828,6 +1030,11 @@ bool ue3_resolve(UE3Layout &L)
 			         (int)L.ar.validated, L.ar.Serialize, L.ar.Tell);
 	}
 
+	resolve_gmalloc(img, L);
+	void *fname_fn = nullptr;
+	uint8_t *fname_fend = nullptr;
+	void **fname_arr = nullptr;
+
 	for (void *fn : anchor::functions_referencing_wstr(
 	         img, L"Hardcoded name '%s' at index %i was duplicated. "
 	              L"Existing entry is '%s'."))
@@ -837,18 +1044,9 @@ bool ue3_resolve(UE3Layout &L)
 		if (dxa::indexed_store_global(fn, fend, arr, static_cast<int>(PS)))
 		{
 			L.FNameNamesArr = reinterpret_cast<uint8_t *>(arr);
-			{
-				ptrdiff_t rvoff = 0;
-				extract_gmalloc_pattern(fn, fend, L.GMalloc, L.GCreateMalloc,
-				                        rvoff);
-				L.ArrayRealloc = dx::call_feeding_global_store(fn, fend, arr);
-				if (L.GMalloc && *L.GMalloc && rvoff > 0 && !L.ArrayRealloc)
-				{
-					void **vt = *reinterpret_cast<void ***>(*L.GMalloc);
-					L.ArrayRealloc = *reinterpret_cast<void **>(
-					    reinterpret_cast<uint8_t *>(vt) + rvoff);
-				}
-			}
+			fname_fn = fn;
+			fname_fend = fend;
+			fname_arr = arr;
 			break;
 		}
 	}
@@ -897,25 +1095,14 @@ bool ue3_resolve(UE3Layout &L)
 				                              static_cast<int>(PS)))
 				{
 					L.FNameNamesArr = reinterpret_cast<uint8_t *>(arr);
-					{
-						ptrdiff_t rvoff = 0;
-						extract_gmalloc_pattern(t.target, tend, L.GMalloc,
-						                        L.GCreateMalloc, rvoff);
-						if (L.GMalloc && *L.GMalloc && rvoff > 0)
-						{
-							void **vt = *reinterpret_cast<void ***>(*L.GMalloc);
-							L.ArrayRealloc = *reinterpret_cast<void **>(
-							    reinterpret_cast<uint8_t *>(vt) + rvoff);
-						}
-					}
+					fname_fn = t.target;
+					fname_fend = tend;
+					fname_arr = arr;
 					log_info(
 					    "resolve: FNameNamesArr=%p via FName::StaticInit=%p "
 					    "(register-fn=%p called %dx)",
 					    (void *)L.FNameNamesArr, static_init, t.target,
 					    t.count);
-					log_info(
-					    "resolve: ArrayRealloc=%p via FName::StaticInit=%p",
-					    (void *)L.ArrayRealloc, static_init);
 
 					break;
 				}
@@ -927,6 +1114,9 @@ bool ue3_resolve(UE3Layout &L)
 				         static_init);
 		}
 	}
+
+	if (fname_fn)
+		resolve_malloc_helpers(fname_fn, fname_fend, fname_arr, L);
 
 	if (L.FNameNamesArr && !L.ArrayRealloc)
 		log_warn("resolve: ArrayRealloc not found (runtime append disabled)");

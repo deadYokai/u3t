@@ -844,6 +844,7 @@ static void inject_new_exports(void *linker, PendingExports &pe)
 		pe.failed = true;
 		return;
 	}
+	log_info("newexports: '%ls' — ExportMap append");
 
 	for (size_t i = 0; i < pe.specs.size(); ++i)
 	{

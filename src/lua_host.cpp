@@ -37,6 +37,10 @@
 
 #include "callconv.hpp"
 
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
 namespace
 {
 	std::vector<sol::protected_function> g_map_cbs;
@@ -260,7 +264,7 @@ namespace
 
 		void *data = (sizeof(void *) == 8)
 		                 ? ue3_api::game_realloc(nullptr, 0, bytes)
-		                 : ue3_api::game_realloc(nullptr, bytes, 8);
+		                 : ue3_api::game_realloc(nullptr, bytes);
 		if (!data)
 			return;
 		memcpy(data, s.c_str(), s.size() * sizeof(wchar_t));
@@ -550,9 +554,9 @@ namespace
 		static dx::CallConvInvoker<void *, void *, const wchar_t *, int, int,
 		                           const wchar_t *>
 		    fn(g_orig_get_section, dx::CallConv::Thiscall);
-		void *Sec = fn(cfg_self(), Section, 0, 1, Filename);
+		void *Sec = fn(self, Section, 0, 1, Filename);
 		if (!Sec && create)
-			Sec = fn(cfg_self(), Section, 1, 0, Filename);
+			Sec = fn(self, Section, 1, 0, Filename);
 		log_debug(
 		    "ret -> cfg_section(Section=%ls, Filename=%ls, create=%i) ; Sec=%p",
 		    Section, Filename, create, Sec);
@@ -1560,24 +1564,26 @@ namespace
 
 	void run_startup_scripts()
 	{
+
 		for (const auto &lm : mod_loader::enabled_mods())
 		{
-			std::wstring path = lm.dir_w + L"\\main.lua";
+			fs::path lua_dir = lm.dir_w;
+			fs::path main_lua = lua_dir / "main.lua";
 
-			if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+			if (GetFileAttributesW(main_lua.c_str()) != INVALID_FILE_ATTRIBUTES)
 			{
-				std::string lua_dir = to_narrow(lm.dir_w);
-
-				std::replace(lua_dir.begin(), lua_dir.end(), '\\', '/');
-
 				sol::table package = (*g_lua)["package"];
 				std::string old_path = package["path"];
 
-				package["path"] = old_path + ";" + lua_dir + "/?.lua;" +
-				                  lua_dir + "/?/init.lua";
+				std::string lua_dir_str = lua_dir.string();
+				char sep = fs::path::preferred_separator;
 
-				log_info("lua: running mod script %ls", path.c_str());
-				lua_host::run_file(path);
+				package["path"] = old_path + ";" + lua_dir_str + sep +
+				                  "?.lua;" + lua_dir_str + sep + "?" + sep +
+				                  "init.lua";
+
+				log_info("lua: running mod script %ls", main_lua.c_str());
+				lua_host::run_file(main_lua.wstring());
 			}
 		}
 
