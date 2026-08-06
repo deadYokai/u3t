@@ -548,7 +548,7 @@ static bool extract_gmalloc_pattern(const void *begin, const void *end,
 }
 
 static void **gmalloc_via_anchor(const ModuleImage &img,
-                                      const wchar_t *anchor_str)
+                                 const wchar_t *anchor_str)
 {
 	for (const void *s : anchor::find_wstr_all(img, anchor_str))
 	{
@@ -1013,9 +1013,8 @@ bool ue3_resolve(UE3Layout &L)
 			         "(expected on old game builds; load-error diagnostics "
 			         "will be less detailed)");
 
-		void *fname_op = anchor::only(
-		    anchor::functions_referencing_wstr(img, L"Bad name index %i/%i"),
-		    "operator<<(FName)");
+		std::vector<void *> fname_ops =
+		    anchor::functions_referencing_wstr(img, L"Bad name index %i/%i");
 
 		void *seek_impl =
 		    anchor::only(anchor::functions_referencing_wstr(
@@ -1023,7 +1022,7 @@ bool ue3_resolve(UE3Layout &L)
 		                 "GetError (via FArchiveFileReaderWindows::Seek)");
 
 		if (L.l_FArchiveOff && L.l_Loader &&
-		    !resolve_farchive_slots(L.ar, L.Preload, fname_op, seek_impl,
+		    !resolve_farchive_slots(L.ar, L.Preload, fname_ops, seek_impl,
 		                            L.l_FArchiveOff, L.l_Loader))
 			log_warn("resolve: FArchive slots not fully derived "
 			         "(validated=%d Serialize=%d Tell=%d) — check this build",

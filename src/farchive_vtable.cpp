@@ -304,7 +304,8 @@ namespace
 	}
 }  // namespace
 
-bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
+bool resolve_farchive_slots(FArchiveSlots &out, void *preload,
+                            const std::vector<void *> &fname_ops,
                             void *seek_impl, ptrdiff_t farchive_off,
                             ptrdiff_t loader_off)
 {
@@ -334,7 +335,7 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 
 	std::vector<ForwarderHit> fwd_hits;
 	int fname_op_self_slot = -1;
-	void *fname = fname_op;
+	int fname_pat_slot = -1;
 
 	if (vt_preload)
 	{
@@ -357,24 +358,24 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 
 			const int self_slot = static_cast<int>((q - lo) / PS);
 
-			if (fname_op_self_slot < 0 && fname_op && fn == fname_op)
+			if (fname_op_self_slot < 0 &&
+			    std::find(fname_ops.begin(), fname_ops.end(),
+			              const_cast<void *>(fn)) != fname_ops.end())
+			{
 				fname_op_self_slot = self_slot;
+				log_info("farchive: operator<<(FName)=%p via vtable "
+				         "referrer (Preload%+d)",
+				         fn, (int)((q - vt_preload) / PS));
+			}
 
-			if (!fname && vt_preload)
+			if (fname_pat_slot < 0)
 			{
 				const ptrdiff_t rel = (q - vt_preload) / PS;
 				if (rel >= 1 && rel <= 8)
 				{
-					auto *cand = const_cast<void *>(fn);
 					const uint8_t *fe = body_end_by_ret(img, fn, 0x200);
 					if (fe > u8(fn) && dx::has_fname_none_compare(fn, fe))
-					{
-						fname = cand;
-						fname_op_self_slot = self_slot;
-						log_info("farchive: operator<<(FName)=%p via "
-						         "NAME_None pattern (Preload%+d)",
-						         cand, (int)rel);
-					}
+						fname_pat_slot = self_slot;
 				}
 			}
 
@@ -390,6 +391,14 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 		if (min_fwd != (1 << 30))
 			out.Serialize = min_fwd;
 		out.total = (std::max)(max_slot_seen + 1, 32);
+
+		if (fname_op_self_slot < 0 && fname_pat_slot >= 0)
+		{
+			fname_op_self_slot = fname_pat_slot;
+			log_info("farchive: operator<<(FName) via NAME_None pattern "
+			         "(slot %d)",
+			         fname_pat_slot);
+		}
 	}
 
 	int slot_bias = 0;
@@ -466,7 +475,6 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 	if (ge > 0)
 		out.GetError = ge;
 
-
 	const bool core_ok = out.Serialize == 1 && out.Tell > 0 &&
 	                     out.Seek == out.Tell + 3 &&
 	                     out.Precache == out.Tell + 6;
@@ -519,7 +527,8 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 		}
 	}
 
-	if (out.GetError <= 0) {
+	if (out.GetError <= 0)
+	{
 		log_err("resolve: GetError not derived");
 	}
 
@@ -532,7 +541,7 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
 	if (out.GetError <= 0)
 	{
 		log_err("resolve: falling back to GetError=21 (UNVERIFIED, known "
-		         "wrong on at least one build — check the warnings above)");
+		        "wrong on at least one build — check the warnings above)");
 		out.GetError = 21;
 	}
 

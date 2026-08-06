@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 struct FArchiveSlots
 {
@@ -15,6 +16,7 @@ struct FArchiveSlots
 	bool validated = false;  // anchors matched the standard layout
 };
 
-bool resolve_farchive_slots(FArchiveSlots &out, void *preload, void *fname_op,
+bool resolve_farchive_slots(FArchiveSlots &out, void *preload,
+                            const std::vector<void *> &fname_ops,
                             void *seek_impl, ptrdiff_t farchive_off,
                             ptrdiff_t loader_off);

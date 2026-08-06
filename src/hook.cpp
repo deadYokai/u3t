@@ -257,22 +257,13 @@ namespace hook
 		written += static_cast<size_t>(len);
 		return written;
 #else
-		req.mnemonic = ZYDIS_MNEMONIC_JMP;
-		req.branch_width = ZYDIS_BRANCH_WIDTH_32;
-		req.operand_count = 1;
-		req.operands[0].type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
-		req.operands[0].imm.u =
-		    static_cast<ZyanU64>(reinterpret_cast<uintptr_t>(target));
-
-		ZyanUSize len = ZYDIS_MAX_INSTRUCTION_LENGTH;
-		if (ZYAN_FAILED(ZydisEncoderEncodeInstructionAbsolute(
-		        &req, at, &len,
-		        static_cast<ZyanU64>(reinterpret_cast<uintptr_t>(at)))))
-		{
-			log_err("hook: encode 'jmp rel32' failed at %p", at);
-			return 0;
-		}
-		return static_cast<size_t>(len);
+		(void)req;
+		uint32_t src = (uint32_t)(uintptr_t)at;
+		uint32_t dst = (uint32_t)(uintptr_t)target;
+		uint32_t rel = dst - (src + 5);  // wraps mod 2^32, correct on hardware
+		at[0] = 0xE9;
+		memcpy(at + 1, &rel, 4);
+		return 5;
 #endif
 	}
 
