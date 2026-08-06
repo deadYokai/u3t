@@ -1,4 +1,5 @@
 build/
 build86/
+dist/
 functions_to_add_to_lua.txt
 compile_commands.json
