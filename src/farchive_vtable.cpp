@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 
+#include "addr_cache.hpp"
 #include "decode.hpp"
 
 #include "asm_pat.hpp"
@@ -315,6 +316,9 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload,
 
 	const ptrdiff_t loader_off_fa = loader_off - farchive_off;
 
+	if (!addr_cache::get_int("ue3.ar.Tell", out.Tell) ||
+	    !addr_cache::get_int("ue3.ar.Seek", out.Seek) ||
+	    !addr_cache::get_int("ue3.ar.Precache", out.Precache))
 	{
 		auto calls = preload_loader_calls(
 		    preload, anchor::function_end(img, preload), loader_off_fa);
@@ -388,7 +392,8 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload,
 			}
 		}
 
-		if (min_fwd != (1 << 30))
+		if (min_fwd != (1 << 30) &&
+		    !addr_cache::get_int("ue3.ar.Serialize", out.Serialize))
 			out.Serialize = min_fwd;
 		out.total = (std::max)(max_slot_seen + 1, 32);
 
@@ -459,15 +464,52 @@ bool resolve_farchive_slots(FArchiveSlots &out, void *preload,
 	}
 
 	bool serialize_name_direct = false;
-	if (fname_op_self_slot >= 0 && have_bias)
+
+	if (fname_op_self_slot >= 0)
 	{
-		out.SerializeName = fname_op_self_slot + slot_bias;
-		serialize_name_direct = true;
+		const uint8_t *lo = vt_preload - 24 * PS;
+		if (lo < img.base)
+			lo = img.base;
+
+		const uint8_t *hi = vt_preload + 24 * PS;
+		if (hi > img.base + img.size - PS)
+			hi = img.base + img.size - PS;
+
+		for (const uint8_t *q = lo; q <= hi; q += PS)
+		{
+			uintptr_t fp = 0;
+			memcpy(&fp, q, PS);
+
+			auto *fn = reinterpret_cast<const void *>(fp);
+			if (fn < img.text || fn >= img.text + img.text_size)
+				continue;
+
+			const int self_slot = static_cast<int>((q - lo) / PS);
+
+			if (self_slot != fname_op_self_slot)
+				continue;
+
+			const int target_slot =
+			    forwarder_slot(fn, u8(fn) + 0x20, loader_off_fa);
+
+			if (target_slot > 0)
+			{
+				out.SerializeName = target_slot;
+				serialize_name_direct = true;
+
+				log_info("farchive: SerializeName=%d via FName operator "
+				         "(self slot=%d)",
+				         out.SerializeName, fname_op_self_slot);
+			}
+
+			break;
+		}
 	}
-	else
+
+	if (!serialize_name_direct)
 	{
-		log_warn("resolve: SerializeName not derived at runtime — no direct "
-		         "operator<<(FName&)");
+		log_warn("resolve: SerializeName not derived at runtime — "
+		         "FName operator has no canonical target slot");
 	}
 
 	int32_t ar_is_error_off = 0;

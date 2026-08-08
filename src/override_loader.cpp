@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "callconv.hpp"
+#include "disp_extract.hpp"
 #include "hook.hpp"
 #include "logs.hpp"
 #include "override_loader.hpp"
@@ -16,8 +18,6 @@
 #include "ue3_layout.hpp"
 #include "ue3_patch.hpp"
 #include "util.hpp"
-
-#include "callconv.hpp"
 
 #include "lua_host.hpp"
 
@@ -100,6 +100,7 @@ static bool g_buf_vt_ready = false;
 static void __fastcall br_Serialize(BufReader *self, UE3_EDX void *dst,
                                     int32_t len)
 {
+	log_debug("call -> br_Serialize(self=%p, dst=%p, len=%i)", self, dst, len);
 	if (len <= 0)
 		return;
 	const size_t want = static_cast<size_t>(len);
@@ -119,8 +120,9 @@ static int32_t __fastcall br_Tell(BufReader *self)
 	                      : static_cast<int32_t>(self->pos);
 }
 
-static void __fastcall br_Seek(BufReader *self, UE3_EDX int32_t pos)
+static void __fastcall br_Seek(BufReader *self, UE3_EDX_ARG int32_t pos)
 {
+	log_debug("call -> br_Seek(self=%p, pos=%i)", self, pos);
 	if (!self->anchored)
 	{
 		self->serial_off = pos;
@@ -433,6 +435,9 @@ static PreloadFn g_orig_Preload = nullptr;
 
 static void call_object_serialize(void *obj, void *linker)
 {
+	log_debug(
+	    "call -> call_object_serialize(obj=%p, linker=%p) ; FArchiveOff=%p",
+	    obj, linker, ue3().l_FArchiveOff);
 	void *farchive = static_cast<uint8_t *>(linker) + ue3().l_FArchiveOff;
 	const int slot = uobj_serialize_slot();
 	if (slot < 0)
@@ -450,6 +455,9 @@ static void call_object_serialize(void *obj, void *linker)
 
 	void **vt = *static_cast<void ***>(obj);
 	using SerializeFn = void(UE3_THISCALL *)(void *, void *);
+	log_debug("call -> call_object_serialize -> SerializeFn(obj=%p, "
+	          "farchive=%p) ; vt slot=%i, vt[slot]=%p",
+	          obj, farchive, slot, vt[slot]);
 	reinterpret_cast<SerializeFn>(vt[slot])(obj, farchive);
 
 	if (ue3().GSerializedObject)
@@ -550,13 +558,11 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 		if (lower_w(root) != lower_w(rec.pkg))
 		{
 			log_warn("override: '%ls' was dumped from '%ls' but this object's "
-			         "linker root is '%ls' (ExportMap=%d NameMap=%d) — passing "
-			         "through",
+			         "linker root is '%ls' (ExportMap=%d NameMap=%d) — "
+			         "attempting override anyway",
 			         rec.key.c_str(), rec.pkg.c_str(),
 			         root.empty() ? L"<unknown>" : root.c_str(),
 			         linker_exportmap(linker).num, linker_namemap(linker).num);
-			orig_preload(linker, obj);
-			return;
 		}
 	}
 
@@ -619,11 +625,7 @@ static void do_override_preload(void *linker, void *obj, void *exp,
 		            static_cast<int32_t>(shadow_nm.size()));
 	}
 
-#if _WIN64
-	br_Seek(&br, exp_serial_offset(exp));
-#else
-	br_Seek(&br, nullptr, exp_serial_offset(exp));
-#endif
+	br_Seek(&br, UE3_EDX_NULL exp_serial_offset(exp));
 
 	uobj_clear_flag(obj, RF_NeedLoad);
 

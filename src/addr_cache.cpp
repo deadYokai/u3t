@@ -98,6 +98,13 @@ namespace
 		return buf;
 	}
 
+	std::string dec_int(int v)
+	{
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%i", (int)v);
+		return buf;
+	}
+
 	bool read_file(const std::wstring &path, std::string &out)
 	{
 		HANDLE h =
@@ -360,6 +367,31 @@ namespace addr_cache
 		if (!g_ready)
 			return;
 		set_entry(key, dec_i64(v));
+	}
+
+	bool get_int(const char *key, int &out)
+	{
+		if (!g_valid)
+			return false;
+
+		const std::string *v = find_entry(key);
+		if (!v)
+			return false;
+
+		char *end = nullptr;
+		long long parsed = strtoll(v->c_str(), &end, 0);
+		if (end == v->c_str())
+			return false;
+
+		out = static_cast<int>(parsed);
+		return true;
+	}
+
+	void put_int(const char *key, int v)
+	{
+		if (!g_ready)
+			return;
+		set_entry(key, dec_int(v));
 	}
 
 	void save()

@@ -768,16 +768,6 @@ bool ue3_resolve(UE3Layout &L)
 	L.GetPackageLinker = anchor::only(
 	    anchor::functions_referencing_wstr(img, L"PackageResolveFailed"),
 	    "GetPackageLinker");
-	if (L.GetPackageLinker)
-	{
-		void **g = nullptr;
-		if (dxa::gpackagefilecache(
-		        L.GetPackageLinker,
-		        anchor::function_end(img, L.GetPackageLinker), g))
-			L.GPackageFileCache = g;
-		else
-			log_warn("resolve: GPackageFileCache not found");
-	}
 
 	{
 		// (UnrealEd.EditorEngine | Editor.EditorEngine) & EditPackages & !Core
@@ -1116,6 +1106,17 @@ bool ue3_resolve(UE3Layout &L)
 
 	if (fname_fn)
 		resolve_malloc_helpers(fname_fn, fname_fend, fname_arr, L);
+
+	if (L.GetPackageLinker)
+	{
+		void **g = nullptr;
+		if (dxa::gpackagefilecache(
+		        L.GetPackageLinker,
+		        anchor::function_end(img, L.GetPackageLinker), g, L.GMalloc))
+			L.GPackageFileCache = g;
+		else
+			log_warn("resolve: GPackageFileCache not found");
+	}
 
 	if (L.FNameNamesArr && !L.ArrayRealloc)
 		log_warn("resolve: ArrayRealloc not found (runtime append disabled)");

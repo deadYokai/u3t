@@ -17,7 +17,7 @@ namespace dxa
 	                                     ptrdiff_t &out_vtoff, int window = 10);
 
 	bool gpackagefilecache(const void *begin, const void *end,
-	                       void **&out_global);
+	                       void **&out_global, void *skip_glob = nullptr);
 
 	bool field_off_for_vslot(const void *begin, const void *end, int slot_index,
 	                         ptrdiff_t &out_off);

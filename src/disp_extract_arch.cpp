@@ -80,7 +80,8 @@ namespace dxa
 	};
 
 	bool scan(const void *begin, const void *end, Mode mode, int slot_index,
-	          int scale, void **&outg, ptrdiff_t &outv, int window)
+	          int scale, void **&outg, ptrdiff_t &outv, int window,
+	          void *skip_glob = nullptr)
 	{
 		bool is_64bit = (PS == 8);
 		ZydisDecoder dec = make_decoder();
@@ -286,6 +287,11 @@ namespace dxa
 				}
 				if (mode == GPFC && ck == PV_GLOB)
 				{
+					if (skip_glob && cg == skip_glob)
+					{
+						p += in.length;
+						continue;
+					}
 					outg = reinterpret_cast<void **>(cg);
 					return true;
 				}
@@ -314,15 +320,20 @@ namespace dxa
 		int64_t fp_slot[16];
 		int64_t fp_src[16];
 		int ecx_obj = -1;
+		bool arv[16];
+		int first_any = -1;  // fallback
 
 		auto clr = [&](int r)
 		{
 			vt_src[r] = SENT;
 			fp_slot[r] = SENT;
 			fp_src[r] = SENT;
+			arv[r] = false;
 		};
 		for (int i = 0; i < 16; ++i)
 			clr(i);
+
+		arv[1] = true;
 
 		while (p < end)
 		{
@@ -345,8 +356,14 @@ namespace dxa
 				if (rt >= 0 && fp_slot[rt] != SENT && fp_src[rt] != SENT &&
 				    fp_src[rt] == ecx_obj)
 				{
-					out_vtoff = static_cast<ptrdiff_t>(fp_slot[rt]);
-					return true;
+					if (first_any < 0)
+						first_any = static_cast<int>(fp_slot[rt]);
+
+					if (ecx_obj >= 0 && !arv[ecx_obj])
+					{
+						out_vtoff = static_cast<ptrdiff_t>(fp_slot[rt]);
+						return true;
+					}
 				}
 			}
 
@@ -372,6 +389,8 @@ namespace dxa
 				if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
 				{
 					int src = gpr_idx(ops[1].reg.value);
+					if (dst >= 0 && src >= 0)
+						arv[dst] = arv[src];
 					if (dst == 1 && src >= 0)
 						ecx_obj = src;
 				}
@@ -386,6 +405,7 @@ namespace dxa
 					                : 0;
 					if (base >= 0)
 					{
+						arv[dst] = arv[base];
 						if (d == 0)
 						{
 							vt_src[dst] = base;
@@ -402,6 +422,13 @@ namespace dxa
 
 			p += in.length;
 		}
+
+		if (first_any >= 0)
+		{
+			out_vtoff = static_cast<ptrdiff_t>(first_any);
+			return true;
+		}
+
 		return false;
 	}
 
@@ -412,10 +439,11 @@ namespace dxa
 		return scan(b, e, GSO, 0, 0, outg, outv, window);
 	}
 
-	bool gpackagefilecache(const void *b, const void *e, void **&outg)
+	bool gpackagefilecache(const void *b, const void *e, void **&outg,
+	                       void *skip_glob)
 	{
 		ptrdiff_t dummy = 0;
-		return scan(b, e, GPFC, 0, 0, outg, dummy, 10);
+		return scan(b, e, GPFC, 0, 0, outg, dummy, 10, skip_glob);
 	}
 
 	bool field_off_for_vslot(const void *b, const void *e, int slot_index,

@@ -33,6 +33,9 @@ namespace addr_cache
 	bool get_i64(const char *key, int64_t &out);
 	void put_i64(const char *key, int64_t v);
 
+	bool get_int(const char *key, int &out);
+	void put_int(const char *key, int v);
+
 	bool load_ue3(UE3Layout &out);
 
 	void store_ue3(const UE3Layout &in);
